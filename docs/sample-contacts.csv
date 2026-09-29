@@ -1,0 +1,8 @@
+﻿Name,Phone,Parent Phone,School,District,Batch,Source,Tags,Notes
+Test Student Amaya (FICTIONAL),0712000001,0772000001,Test College A,Colombo,2027 A/L,Facebook ad,theory,FICTIONAL sample row
+Test Student Bimal (FICTIONAL),712000002,,Test Vidyalaya B,kandy,2027 A/L,Seminar,,
+පරීක්ෂණ සිසුවා චමරි (FICTIONAL),+94 71 200 0003,,පරීක්ෂණ විද්‍යාලය,Galle,2027 A/L,Seminar,revision; theory,සිංහල සටහන
+Test Student Dilan (FICTIONAL),94712000004,,Sample MV C,Gampaha,2027 A/L,,,"Said ""call after 6pm"", maybe"
+Test Student Erandi (FICTIONAL),0712000001,,Test College A,Colombo,2027 A/L,,,Duplicate phone of Amaya
+,0712000006,,,,,,,Missing name
+Test Student Gayan (FICTIONAL),12345,,,,,,,Invalid phone
