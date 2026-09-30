@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import NextAuth, { CredentialsSignin } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
-import { connectDb } from "@/lib/db";
-import { User } from "@/lib/models/user";
+import { eq } from "drizzle-orm";
+import { db, users } from "@/lib/db";
 import { verifyPassword } from "@/lib/password";
 import { clear, hit } from "@/lib/rate-limit";
 import { loginSchema } from "@/lib/schemas";
@@ -32,19 +32,18 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         const parsed = loginSchema.safeParse({ email: raw.email, password: raw.password }); // raw also carries redirectTo etc.
         if (!parsed.success) return null;
         const { email, password } = parsed.data;
-        await connectDb();
 
         const emailKey = "email:" + createHash("sha256").update(email).digest("hex");
         const ip = request.headers.get("x-forwarded-for")?.split(",")[0].trim() || "unknown";
         const [emailOk, ipOk] = await Promise.all([hit(emailKey, 5, WINDOW), hit("ip:" + ip, IP_LIMIT, WINDOW)]);
         if (!emailOk || !ipOk) throw new RateLimited();
 
-        const user = await User.findOne({ email });
+        const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
         const valid = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
         if (!user || !valid || !user.active) return null;
 
         await clear(emailKey);
-        return { id: String(user._id), name: user.name, email: user.email, tokenVersion: user.tokenVersion };
+        return { id: user.id, name: user.name, email: user.email, tokenVersion: user.tokenVersion };
       },
     }),
   ],

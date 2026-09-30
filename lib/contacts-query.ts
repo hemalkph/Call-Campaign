@@ -1,11 +1,10 @@
 // Who can see which campaigns and contacts. Every contact read (table, sheet, export)
 // builds its filter here so callers can never see contacts assigned to someone else.
-import { type QueryFilter, Types } from "mongoose";
+import { and, arrayContains, asc, count, desc, eq, exists, ilike, inArray, isNotNull, isNull, ne, or, type SQL, sql } from "drizzle-orm";
 import { z } from "zod";
-import { Campaign } from "./models/campaign";
-import { Contact, type ContactDoc } from "./models/contact";
+import { campaignCallers, campaigns, contacts, db } from "./db";
 import { normalizePhone } from "./phone";
-import { objectId } from "./schemas";
+import { recordId } from "./schemas";
 import type { CurrentUser } from "./session";
 import { OUTCOMES, STAGES } from "./vocab";
 
@@ -14,10 +13,10 @@ export const SORTS = ["name", "stage", "lastCallAt", "nextCallbackAt", "createdA
 
 // Junk in the URL is ignored, never an error.
 export const listParamsSchema = z.object({
-  campaign: objectId.optional().catch(undefined),
+  campaign: recordId.optional().catch(undefined),
   q: z.string().trim().max(100).optional().catch(undefined),
   stage: z.enum(STAGES).optional().catch(undefined),
-  caller: z.union([objectId, z.literal("none")]).optional().catch(undefined),
+  caller: z.union([recordId, z.literal("none")]).optional().catch(undefined),
   outcome: z.enum(OUTCOMES).optional().catch(undefined),
   tag: z.string().max(40).optional().catch(undefined),
   district: z.string().max(60).optional().catch(undefined),
@@ -37,56 +36,89 @@ export function parseListParams(sp: Record<string, string | string[] | undefined
 }
 
 /** Owners see every campaign; callers only campaigns they're on. */
-export function campaignScope(user: CurrentUser) {
-  return user.role === "owner" ? {} : { "callers.userId": new Types.ObjectId(user.id) };
+export function campaignScope(user: CurrentUser): SQL | undefined {
+  if (user.role === "owner") return undefined;
+  return exists(
+    db
+      .select({ x: sql`1` })
+      .from(campaignCallers)
+      .where(and(eq(campaignCallers.campaignId, campaigns.id), eq(campaignCallers.userId, user.id))),
+  );
+}
+
+/** Caller ids per campaign, in the owner's chosen order. */
+export async function callersOf(campaignIds: string[]) {
+  const rows = campaignIds.length
+    ? await db
+        .select()
+        .from(campaignCallers)
+        .where(inArray(campaignCallers.campaignId, campaignIds))
+        .orderBy(asc(campaignCallers.position))
+    : [];
+  return (id: string) => rows.filter((r) => r.campaignId === id);
 }
 
 export async function visibleCampaigns(user: CurrentUser) {
-  const list = await Campaign.find(campaignScope(user), { name: 1, status: 1, startDate: 1, callers: 1 })
-    .sort({ status: 1, startDate: -1 }) // "active" sorts before "draft"/"ended"
-    .lean();
-  return list.map((c) => ({ id: String(c._id), name: c.name, status: c.status, callerIds: c.callers.map((x) => String(x.userId)) }));
+  const list = await db
+    .select({ id: campaigns.id, name: campaigns.name, status: campaigns.status })
+    .from(campaigns)
+    .where(campaignScope(user))
+    .orderBy(asc(campaigns.status), desc(campaigns.startDate)); // "active" sorts before "draft"/"ended"
+  const callers = await callersOf(list.map((c) => c.id));
+  return list.map((c) => ({ ...c, callerIds: callers(c.id).map((x) => x.userId) }));
 }
 
-const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Escapes % _ \ so user search text is matched literally by ILIKE. */
+const like = (s: string) => `%${s.replace(/[\\%_]/g, "\\$&")}%`;
 
-export function contactFilter(user: CurrentUser, campaignId: string, p: Partial<ListParams>): QueryFilter<ContactDoc> {
-  const f: QueryFilter<ContactDoc> = { campaignId: new Types.ObjectId(campaignId) };
+export function contactFilter(user: CurrentUser, campaignId: string, p: Partial<ListParams>): SQL {
+  const f: (SQL | undefined)[] = [eq(contacts.campaignId, campaignId)];
 
-  if (user.role !== "owner") f.assignedTo = new Types.ObjectId(user.id);
-  else if (p.caller) f.assignedTo = p.caller === "none" ? null : new Types.ObjectId(p.caller);
+  if (user.role !== "owner") f.push(eq(contacts.assignedTo, user.id));
+  else if (p.caller) f.push(p.caller === "none" ? isNull(contacts.assignedTo) : eq(contacts.assignedTo, p.caller));
 
   if (p.q) {
-    const rx = new RegExp(escape(p.q), "i");
-    const or: QueryFilter<ContactDoc>[] = [{ name: rx }, { school: rx }];
+    const text = like(p.q);
+    const any: SQL[] = [ilike(contacts.name, text), ilike(contacts.school, text)];
     const digits = p.q.replace(/\D/g, "");
     if (digits.length >= 3) {
       const full = normalizePhone(p.q);
-      or.push({ phone: full.ok ? full.phone : { $regex: escape(digits) } });
+      any.push(full.ok ? eq(contacts.phone, full.phone) : ilike(contacts.phone, like(digits)));
     }
-    f.$or = or;
+    f.push(or(...any));
   }
-  if (p.stage) f.stage = p.stage;
-  if (p.outcome) f.lastOutcome = p.outcome;
-  if (p.tag) f.tags = p.tag;
-  if (p.district) f.district = p.district;
-  if (p.source !== undefined) f.source = p.source === "(none)" ? { $in: [null, ""] } : p.source;
-  if (p.callback) f.nextCallbackAt = { $ne: null };
-  if (p.notCalled) f.lastCallAt = null;
-  if (p.notMessaged) f.lastWhatsappAt = null;
-  return f;
+  if (p.stage) f.push(eq(contacts.stage, p.stage));
+  if (p.outcome) f.push(eq(contacts.lastOutcome, p.outcome));
+  if (p.tag) f.push(arrayContains(contacts.tags, [p.tag]));
+  if (p.district) f.push(eq(contacts.district, p.district));
+  if (p.source !== undefined) f.push(eq(contacts.source, p.source === "(none)" ? "" : p.source));
+  if (p.callback) f.push(isNotNull(contacts.nextCallbackAt));
+  if (p.notCalled) f.push(isNull(contacts.lastCallAt));
+  if (p.notMessaged) f.push(isNull(contacts.lastWhatsappAt));
+  return and(...f)!;
 }
 
+const SORT_COLUMN = {
+  name: contacts.name,
+  stage: contacts.stage,
+  lastCallAt: contacts.lastCallAt,
+  nextCallbackAt: contacts.nextCallbackAt,
+  createdAt: contacts.createdAt,
+} as const;
+
 export async function listContacts(user: CurrentUser, campaignId: string, p: ListParams) {
-  const filter = contactFilter(user, campaignId, p);
-  const dir = p.dir === "asc" ? 1 : -1;
-  const [rows, total] = await Promise.all([
-    Contact.find(filter, { importBatchId: 0 })
-      .sort({ [p.sort]: dir, _id: dir })
-      .skip((p.page - 1) * PAGE_SIZE)
+  const where = contactFilter(user, campaignId, p);
+  const col = SORT_COLUMN[p.sort];
+  const order = p.dir === "asc" ? [sql`${col} asc nulls last`, asc(contacts.id)] : [sql`${col} desc nulls last`, desc(contacts.id)];
+  const [rows, [{ total }]] = await Promise.all([
+    db
+      .select()
+      .from(contacts)
+      .where(where)
+      .orderBy(...order)
       .limit(PAGE_SIZE)
-      .lean(),
-    Contact.countDocuments(filter),
+      .offset((p.page - 1) * PAGE_SIZE),
+    db.select({ total: count() }).from(contacts).where(where),
   ]);
   return { rows, total };
 }
@@ -94,22 +126,31 @@ export async function listContacts(user: CurrentUser, campaignId: string, p: Lis
 /** Distinct tags / districts for the filter dropdowns, within what this user can see. */
 export async function filterOptions(user: CurrentUser, campaignId: string) {
   const base = contactFilter(user, campaignId, {});
-  const [tags, districts] = await Promise.all([Contact.distinct("tags", base), Contact.distinct("district", base)]);
-  return { tags: (tags as string[]).sort(), districts: (districts as string[]).filter(Boolean).sort() };
+  const [tags, districts] = await Promise.all([
+    db.selectDistinct({ v: sql<string>`unnest(${contacts.tags})` }).from(contacts).where(base),
+    db.selectDistinct({ v: contacts.district }).from(contacts).where(and(base, ne(contacts.district, ""))),
+  ]);
+  const sorted = (rows: { v: string }[]) => rows.map((r) => r.v).sort((a, b) => a.localeCompare(b));
+  return { tags: sorted(tags), districts: sorted(districts) };
 }
 
 /** Active campaigns this user calls for, with their personal daily target. */
 export async function activeCampaignsFor(user: CurrentUser) {
-  const list = await Campaign.find({ status: "active", "callers.userId": new Types.ObjectId(user.id) }).sort({ startDate: -1 }).lean();
-  return list.map((c) => ({
-    id: String(c._id),
+  const list = await db
+    .select({ c: campaigns, ownTarget: campaignCallers.dailyCallTarget })
+    .from(campaigns)
+    .innerJoin(campaignCallers, and(eq(campaignCallers.campaignId, campaigns.id), eq(campaignCallers.userId, user.id)))
+    .where(eq(campaigns.status, "active"))
+    .orderBy(desc(campaigns.startDate));
+  return list.map(({ c, ownTarget }) => ({
+    id: c.id,
     name: c.name,
     classLabel: c.classLabel,
     startDate: c.startDate,
     fee: c.fee,
     link: c.link,
     script: c.script,
-    target: c.callers.find((x) => String(x.userId) === user.id)?.dailyCallTarget ?? c.dailyCallTarget,
+    target: ownTarget ?? c.dailyCallTarget,
   }));
 }
 export type ActiveCampaign = Awaited<ReturnType<typeof activeCampaignsFor>>[number];

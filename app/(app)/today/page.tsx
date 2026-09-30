@@ -1,4 +1,3 @@
-import { Types } from "mongoose";
 import { AlarmClock, PhoneCall } from "lucide-react";
 import Link from "next/link";
 import { PageHeader } from "@/components/page-header";
@@ -7,9 +6,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Progress } from "@/components/ui/progress";
 import { REACHED_OUTCOMES } from "@/lib/calling";
 import { activeCampaignsFor } from "@/lib/contacts-query";
-import { Call } from "@/lib/models/call";
-import { Callback } from "@/lib/models/callback";
-import { Contact } from "@/lib/models/contact";
+import { and, asc, eq, gte, inArray, lt, sql } from "drizzle-orm";
+import { callbacks, calls, contacts, db } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { dayBounds, fmtDateTime, fmtTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -21,23 +19,26 @@ export default async function TodayPage() {
   const campaigns = await activeCampaignsFor(me);
   const now = new Date();
   const { start, end } = dayBounds(now);
-  const myId = new Types.ObjectId(me.id);
-  const campaignIds = campaigns.map((c) => new Types.ObjectId(c.id));
+  const campaignIds = campaigns.map((c) => c.id);
+  const mine = and(eq(calls.callerId, me.id), gte(calls.calledAt, start));
 
-  const [callsByCampaign, answered, dueCallbacks] = await Promise.all([
-    Call.aggregate<{ _id: Types.ObjectId; n: number }>([
-      { $match: { callerId: myId, calledAt: { $gte: start } } },
-      { $group: { _id: "$campaignId", n: { $sum: 1 } } },
-    ]),
-    Call.countDocuments({ callerId: myId, calledAt: { $gte: start }, outcome: { $in: REACHED_OUTCOMES } }),
-    Callback.find({ callerId: myId, status: "pending", campaignId: { $in: campaignIds }, dueAt: { $lt: end } }).sort({ dueAt: 1 }).limit(50).lean(),
+  const [callsByCampaign, [{ answered }], dueCallbacks] = await Promise.all([
+    db.select({ campaignId: calls.campaignId, n: sql<number>`count(*)::int` }).from(calls).where(mine).groupBy(calls.campaignId),
+    db.select({ answered: sql<number>`count(*)::int` }).from(calls).where(and(mine, inArray(calls.outcome, REACHED_OUTCOMES))),
+    campaignIds.length
+      ? db
+          .select({ cb: callbacks, name: contacts.name })
+          .from(callbacks)
+          .innerJoin(contacts, eq(contacts.id, callbacks.contactId))
+          .where(and(eq(callbacks.callerId, me.id), eq(callbacks.status, "pending"), inArray(callbacks.campaignId, campaignIds), lt(callbacks.dueAt, end)))
+          .orderBy(asc(callbacks.dueAt))
+          .limit(50)
+      : [],
   ]);
-  const contacts = await Contact.find({ _id: { $in: dueCallbacks.map((c) => c.contactId) } }, { name: 1, phone: 1 }).lean();
-  const contactOf = (id: unknown) => contacts.find((c) => String(c._id) === String(id));
-  const calls = (id: string) => callsByCampaign.find((c) => String(c._id) === id)?.n ?? 0;
+  const calls_ = (id: string) => callsByCampaign.find((c) => c.campaignId === id)?.n ?? 0;
   const totalCalls = callsByCampaign.reduce((n, c) => n + c.n, 0);
-  const overdue = dueCallbacks.filter((c) => c.dueAt < now);
-  const later = dueCallbacks.filter((c) => c.dueAt >= now);
+  const overdue = dueCallbacks.filter(({ cb }) => cb.dueAt < now);
+  const later = dueCallbacks.filter(({ cb }) => cb.dueAt >= now);
 
   return (
     <>
@@ -65,10 +66,10 @@ export default async function TodayPage() {
               </CardHeader>
               <CardContent className="space-y-2">
                 <p className="text-3xl font-semibold tabular-nums">
-                  {calls(c.id)}
+                  {calls_(c.id)}
                   {c.target > 0 && <span className="text-lg font-normal text-muted-foreground"> / {c.target}</span>}
                 </p>
-                {c.target > 0 && <Progress value={Math.min(100, (calls(c.id) / c.target) * 100)} aria-label={`Calls today for ${c.name} against target`} />}
+                {c.target > 0 && <Progress value={Math.min(100, (calls_(c.id) / c.target) * 100)} aria-label={`Calls today for ${c.name} against target`} />}
                 {campaigns.length > 1 && (
                   <Button asChild variant="link" className="px-0">
                     <Link href={`/calling?campaign=${c.id}`}>Call for this campaign</Link>
@@ -105,12 +106,12 @@ export default async function TodayPage() {
                 <p className="text-sm text-muted-foreground">No callbacks due today.</p>
               ) : (
                 <ul className="divide-y">
-                  {dueCallbacks.map((cb) => {
+                  {dueCallbacks.map(({ cb, name }) => {
                     const late = cb.dueAt < now;
                     return (
-                      <li key={String(cb._id)} className="flex items-center justify-between gap-3 py-2">
+                      <li key={cb.id} className="flex items-center justify-between gap-3 py-2">
                         <div className="min-w-0">
-                          <p className="truncate font-medium">{contactOf(cb.contactId)?.name ?? "Contact"}</p>
+                          <p className="truncate font-medium">{name}</p>
                           <p className={cn("text-sm", late ? "font-medium text-destructive" : "text-muted-foreground")}>
                             {late ? `Overdue · ${fmtDateTime(cb.dueAt)}` : fmtTime(cb.dueAt)}
                             {cb.note && ` · ${cb.note}`}

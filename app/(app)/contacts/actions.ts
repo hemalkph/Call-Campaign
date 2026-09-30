@@ -1,42 +1,50 @@
 "use server";
 
-import { Types } from "mongoose";
+import { and, arrayContains, desc, eq, inArray, isNull, ne, not, or, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-import { campaignScope } from "@/lib/contacts-query";
-import { audit } from "@/lib/models/audit-event";
-import { Callback } from "@/lib/models/callback";
-import { Campaign } from "@/lib/models/campaign";
-import { Contact } from "@/lib/models/contact";
-import { Call } from "@/lib/models/call";
-import { User } from "@/lib/models/user";
-import { WhatsappLog } from "@/lib/models/whatsapp-log";
 import { z } from "zod";
-import { bulkContactsSchema, createContactSchema, objectId, updateContactSchema } from "@/lib/schemas";
-import { STAGES } from "@/lib/vocab";
-
-const setStageSchema = z.strictObject({ id: objectId, stage: z.enum(STAGES) });
+import { audit } from "@/lib/audit";
+import { campaignScope } from "@/lib/contacts-query";
+import { callbacks, calls, campaignCallers, campaigns, contacts, db, users, whatsappLogs } from "@/lib/db";
+import { isUniqueViolation } from "@/lib/db/tx";
+import { bulkContactsSchema, createContactSchema, recordId, updateContactSchema } from "@/lib/schemas";
 import { type CurrentUser, requireOwner, requireUser } from "@/lib/session";
+import { STAGES } from "@/lib/vocab";
 
 type Result<T = object> = ({ ok: true } & T) | { ok: false; error: string };
 
 const DUPLICATE = "This phone number is already in this campaign.";
-const isDuplicateKey = (e: unknown) => (e as { code?: number })?.code === 11000;
-const oid = (id: string) => new Types.ObjectId(id);
+const NOT_ON_CAMPAIGN = "That caller isn't on this campaign.";
+const setStageSchema = z.strictObject({ id: recordId, stage: z.enum(STAGES) });
+
+/** Contacts a user may see and edit: all for owners, their own for callers. */
+const mine = (user: CurrentUser) => (user.role === "owner" ? undefined : eq(contacts.assignedTo, user.id));
+
+const isCampaignCaller = async (campaignId: string, userId: string) =>
+  (
+    await db
+      .select({ x: sql`1` })
+      .from(campaignCallers)
+      .where(and(eq(campaignCallers.campaignId, campaignId), eq(campaignCallers.userId, userId)))
+      .limit(1)
+  ).length > 0;
 
 /** Owners pick any caller on the campaign ("" = unassigned); callers always get the contact themselves. */
 async function resolveAssignee(user: CurrentUser, campaignId: string, requested: string | undefined) {
-  if (user.role !== "owner") return { ok: true as const, value: oid(user.id) };
+  if (user.role !== "owner") return { ok: true as const, value: user.id };
   if (!requested) return { ok: true as const, value: null };
-  const onCampaign = await Campaign.exists({ _id: campaignId, "callers.userId": oid(requested) });
-  return onCampaign ? { ok: true as const, value: oid(requested) } : { ok: false as const };
+  return (await isCampaignCaller(campaignId, requested)) ? { ok: true as const, value: requested } : { ok: false as const };
 }
 
 async function otherCampaignNames(user: CurrentUser, phone: string, campaignId: string) {
-  const ids = await Contact.distinct("campaignId", { phone, campaignId: { $ne: oid(campaignId) } });
-  if (!ids.length) return undefined;
+  const others = await db
+    .selectDistinct({ name: campaigns.name })
+    .from(contacts)
+    .innerJoin(campaigns, eq(campaigns.id, contacts.campaignId))
+    .where(and(eq(contacts.phone, phone), ne(contacts.campaignId, campaignId)));
+  if (!others.length) return undefined;
   if (user.role !== "owner") return "This number is also in another campaign.";
-  const names = await Campaign.find({ _id: { $in: ids } }, { name: 1 }).lean();
-  return `This number is also in: ${names.map((c) => c.name).join(", ")}.`;
+  return `This number is also in: ${others.map((c) => c.name).join(", ")}.`;
 }
 
 export async function createContact(input: unknown): Promise<Result<{ id: string; warning?: string }>> {
@@ -45,16 +53,20 @@ export async function createContact(input: unknown): Promise<Result<{ id: string
   if (!parsed.success) return { ok: false, error: "Check the highlighted fields." };
   const { campaignId, assignedTo, stage: _ignored, ...fields } = parsed.data; // eslint-disable-line @typescript-eslint/no-unused-vars
 
-  if (!(await Campaign.exists({ _id: campaignId, ...campaignScope(user) }))) return { ok: false, error: "Campaign not found." };
+  const [campaign] = await db.select({ id: campaigns.id }).from(campaigns).where(and(eq(campaigns.id, campaignId), campaignScope(user)));
+  if (!campaign) return { ok: false, error: "Campaign not found." };
   const assignee = await resolveAssignee(user, campaignId, assignedTo);
-  if (!assignee.ok) return { ok: false, error: "That caller isn't on this campaign." };
+  if (!assignee.ok) return { ok: false, error: NOT_ON_CAMPAIGN };
 
   try {
-    const contact = await Contact.create({ ...fields, campaignId, assignedTo: assignee.value });
+    const [contact] = await db
+      .insert(contacts)
+      .values({ ...fields, altPhone: fields.altPhone ?? null, campaignId, assignedTo: assignee.value })
+      .returning({ id: contacts.id });
     revalidatePath("/contacts");
-    return { ok: true, id: String(contact._id), warning: await otherCampaignNames(user, fields.phone, campaignId) };
+    return { ok: true, id: contact.id, warning: await otherCampaignNames(user, fields.phone, campaignId) };
   } catch (e) {
-    if (isDuplicateKey(e)) return { ok: false, error: DUPLICATE };
+    if (isUniqueViolation(e)) return { ok: false, error: DUPLICATE };
     throw e;
   }
 }
@@ -65,32 +77,34 @@ export async function updateContact(input: unknown): Promise<Result> {
   if (!parsed.success) return { ok: false, error: "Check the highlighted fields." };
   const { id, assignedTo, stage, ...fields } = parsed.data;
 
-  const contact = await Contact.findOne({ _id: id, ...(user.role === "owner" ? {} : { assignedTo: oid(user.id) }) });
+  const [contact] = await db.select().from(contacts).where(and(eq(contacts.id, id), mine(user)));
   if (!contact) return { ok: false, error: "Contact not found." };
-  const before = { stage: contact.stage, assignedTo: contact.assignedTo ? String(contact.assignedTo) : null };
 
-  contact.set({ ...fields, altPhone: fields.altPhone ?? "" });
-  if (stage && stage !== contact.stage) contact.set({ stage, stageChangedAt: new Date() });
-  if (user.role === "owner" && assignedTo !== undefined && assignedTo !== (before.assignedTo ?? "")) {
-    const assignee = await resolveAssignee(user, String(contact.campaignId), assignedTo);
-    if (!assignee.ok) return { ok: false, error: "That caller isn't on this campaign." };
-    contact.assignedTo = assignee.value;
+  const changes: Partial<typeof contacts.$inferInsert> = { ...fields, altPhone: fields.altPhone ?? null };
+  if (stage && stage !== contact.stage) Object.assign(changes, { stage, stageChangedAt: new Date() });
+  if (user.role === "owner" && assignedTo !== undefined && assignedTo !== (contact.assignedTo ?? "")) {
+    const assignee = await resolveAssignee(user, contact.campaignId, assignedTo);
+    if (!assignee.ok) return { ok: false, error: NOT_ON_CAMPAIGN };
+    changes.assignedTo = assignee.value;
   }
 
   try {
-    await contact.save();
+    await db.transaction(async (tx) => {
+      await tx.update(contacts).set(changes).where(eq(contacts.id, id));
+      const base = { actorId: user.id, entity: "contacts", entityId: id };
+      if (changes.stage)
+        await audit({ ...base, action: "contact.stage", before: { stage: contact.stage }, after: { stage: changes.stage } }, tx);
+      if (changes.assignedTo !== undefined) {
+        await tx.update(callbacks).set({ callerId: changes.assignedTo }).where(and(eq(callbacks.contactId, id), eq(callbacks.status, "pending")));
+        await audit(
+          { ...base, action: "contact.reassign", before: { assignedTo: contact.assignedTo }, after: { assignedTo: changes.assignedTo } },
+          tx,
+        );
+      }
+    });
   } catch (e) {
-    if (isDuplicateKey(e)) return { ok: false, error: DUPLICATE };
+    if (isUniqueViolation(e)) return { ok: false, error: DUPLICATE };
     throw e;
-  }
-
-  const after = { stage: contact.stage, assignedTo: contact.assignedTo ? String(contact.assignedTo) : null };
-  const base = { actorId: user.id, entity: "contacts", entityId: contact._id };
-  if (after.stage !== before.stage)
-    await audit({ ...base, action: "contact.stage", before: { stage: before.stage }, after: { stage: after.stage } });
-  if (after.assignedTo !== before.assignedTo) {
-    await Callback.updateMany({ contactId: contact._id, status: "pending" }, { callerId: contact.assignedTo });
-    await audit({ ...base, action: "contact.reassign", before: { assignedTo: before.assignedTo }, after: { assignedTo: after.assignedTo } });
   }
 
   revalidatePath("/contacts");
@@ -102,44 +116,70 @@ export async function bulkUpdateContacts(input: unknown): Promise<Result<{ chang
   const parsed = bulkContactsSchema.safeParse(input);
   if (!parsed.success) return { ok: false, error: "Invalid request." };
   const p = parsed.data;
-  const ids = p.ids.map(oid);
+  const selected = inArray(contacts.id, p.ids);
 
-  let changed = 0;
-  if (p.action === "reassign") {
-    // Every selected contact's campaign must have this caller on it.
-    const campaignIds = await Contact.distinct("campaignId", { _id: { $in: ids } });
-    if (p.assignedTo) {
-      const ok = await Campaign.countDocuments({ _id: { $in: campaignIds }, "callers.userId": oid(p.assignedTo) });
-      if (ok !== campaignIds.length) return { ok: false, error: "That caller isn't on this campaign." };
+  const changed = await db.transaction(async (tx) => {
+    if (p.action === "reassign") {
+      const to = p.assignedTo || null;
+      if (to) {
+        // Every selected contact's campaign must have this caller on it.
+        const missing = await tx
+          .selectDistinct({ campaignId: contacts.campaignId })
+          .from(contacts)
+          .leftJoin(campaignCallers, and(eq(campaignCallers.campaignId, contacts.campaignId), eq(campaignCallers.userId, to)))
+          .where(and(selected, isNull(campaignCallers.userId)));
+        if (missing.length) return null;
+      }
+      const moving = await tx
+        .select({ id: contacts.id, assignedTo: contacts.assignedTo })
+        .from(contacts)
+        .where(and(selected, to ? or(isNull(contacts.assignedTo), ne(contacts.assignedTo, to)) : sql`${contacts.assignedTo} is not null`));
+      if (!moving.length) return 0;
+      const ids = moving.map((c) => c.id);
+      await tx.update(contacts).set({ assignedTo: to }).where(inArray(contacts.id, ids));
+      await tx.update(callbacks).set({ callerId: to }).where(and(inArray(callbacks.contactId, ids), eq(callbacks.status, "pending")));
+      await audit(
+        {
+          actorId: me.id,
+          action: "contact.bulk_reassign",
+          entity: "contacts",
+          before: { assignedTo: Object.fromEntries(moving.map((c) => [c.id, c.assignedTo])) },
+          after: { assignedTo: to },
+        },
+        tx,
+      );
+      return moving.length;
     }
-    const to = p.assignedTo ? oid(p.assignedTo) : null;
-    const moving = await Contact.find({ _id: { $in: ids }, assignedTo: { $ne: to } }, { assignedTo: 1 }).lean();
-    changed = (await Contact.updateMany({ _id: { $in: moving.map((c) => c._id) } }, { assignedTo: to })).modifiedCount;
-    await Callback.updateMany({ contactId: { $in: moving.map((c) => c._id) }, status: "pending" }, { callerId: to });
-    if (changed)
-      await audit({
-        actorId: me.id,
-        action: "contact.bulk_reassign",
-        entity: "contacts",
-        before: { assignedTo: Object.fromEntries(moving.map((c) => [String(c._id), c.assignedTo ? String(c.assignedTo) : null])) },
-        after: { assignedTo: p.assignedTo || null },
-      });
-  } else if (p.action === "stage") {
-    const moving = await Contact.find({ _id: { $in: ids }, stage: { $ne: p.stage } }, { stage: 1 }).lean();
-    changed = (
-      await Contact.updateMany({ _id: { $in: moving.map((c) => c._id) } }, { stage: p.stage, stageChangedAt: new Date() })
-    ).modifiedCount;
-    if (changed)
-      await audit({
-        actorId: me.id,
-        action: "contact.bulk_stage",
-        entity: "contacts",
-        before: { stage: Object.fromEntries(moving.map((c) => [String(c._id), c.stage])) },
-        after: { stage: p.stage },
-      });
-  } else {
-    changed = (await Contact.updateMany({ _id: { $in: ids } }, { $addToSet: { tags: p.tag } })).modifiedCount;
-  }
+    if (p.action === "stage") {
+      const moving = await tx
+        .select({ id: contacts.id, stage: contacts.stage })
+        .from(contacts)
+        .where(and(selected, ne(contacts.stage, p.stage)));
+      if (!moving.length) return 0;
+      await tx
+        .update(contacts)
+        .set({ stage: p.stage, stageChangedAt: new Date() })
+        .where(inArray(contacts.id, moving.map((c) => c.id)));
+      await audit(
+        {
+          actorId: me.id,
+          action: "contact.bulk_stage",
+          entity: "contacts",
+          before: { stage: Object.fromEntries(moving.map((c) => [c.id, c.stage])) },
+          after: { stage: p.stage },
+        },
+        tx,
+      );
+      return moving.length;
+    }
+    const tagged = await tx
+      .update(contacts)
+      .set({ tags: sql`array_append(${contacts.tags}, ${p.tag})` })
+      .where(and(selected, not(arrayContains(contacts.tags, [p.tag]))))
+      .returning({ id: contacts.id });
+    return tagged.length;
+  });
+  if (changed === null) return { ok: false, error: NOT_ON_CAMPAIGN };
 
   revalidatePath("/contacts");
   return { ok: true, changed };
@@ -154,25 +194,42 @@ export type Activity = {
 /** Call history, WhatsApp log and callbacks for the contact sheet. */
 export async function getContactActivity(input: unknown): Promise<Result<{ activity: Activity }>> {
   const user = await requireUser();
-  const id = objectId.safeParse(input);
+  const id = recordId.safeParse(input);
   if (!id.success) return { ok: false, error: "Invalid request." };
-  const contact = await Contact.exists({ _id: id.data, ...(user.role === "owner" ? {} : { assignedTo: oid(user.id) }) });
+  const [contact] = await db.select({ id: contacts.id }).from(contacts).where(and(eq(contacts.id, id.data), mine(user)));
   if (!contact) return { ok: false, error: "Contact not found." };
 
-  const [calls, logs, callbacks] = await Promise.all([
-    Call.find({ contactId: id.data }).sort({ calledAt: -1 }).limit(100).lean(),
-    WhatsappLog.find({ contactId: id.data }).sort({ sentAt: -1 }).limit(100).lean(),
-    Callback.find({ contactId: id.data }).sort({ dueAt: -1 }).limit(50).lean(),
+  const [callRows, logRows, callbackRows] = await Promise.all([
+    db
+      .select({ c: calls, caller: users.name })
+      .from(calls)
+      .leftJoin(users, eq(users.id, calls.callerId))
+      .where(eq(calls.contactId, id.data))
+      .orderBy(desc(calls.calledAt))
+      .limit(100),
+    db
+      .select({ l: whatsappLogs, caller: users.name })
+      .from(whatsappLogs)
+      .leftJoin(users, eq(users.id, whatsappLogs.callerId))
+      .where(eq(whatsappLogs.contactId, id.data))
+      .orderBy(desc(whatsappLogs.sentAt))
+      .limit(100),
+    db.select().from(callbacks).where(eq(callbacks.contactId, id.data)).orderBy(desc(callbacks.dueAt)).limit(50),
   ]);
-  const users = await User.find({ _id: { $in: [...calls.map((c) => c.callerId), ...logs.map((l) => l.callerId)] } }, { name: 1 }).lean();
-  const name = (uid: unknown) => users.find((u) => String(u._id) === String(uid))?.name ?? "";
   return {
     ok: true,
     activity: {
-      calls: calls.map((c) => ({ id: String(c._id), at: c.calledAt.toISOString(), outcome: c.outcome, notes: c.notes, durationSec: c.durationSec ?? undefined, caller: name(c.callerId) })),
-      whatsapp: logs.map((l) => ({ id: String(l._id), at: l.sentAt.toISOString(), template: l.templateName, caller: name(l.callerId) })),
-      callbacks: callbacks.map((c) => ({
-        id: String(c._id),
+      calls: callRows.map(({ c, caller }) => ({
+        id: c.id,
+        at: c.calledAt.toISOString(),
+        outcome: c.outcome,
+        notes: c.notes,
+        durationSec: c.durationSec ?? undefined,
+        caller: caller ?? "",
+      })),
+      whatsapp: logRows.map(({ l, caller }) => ({ id: l.id, at: l.sentAt.toISOString(), template: l.templateName, caller: caller ?? "" })),
+      callbacks: callbackRows.map((c) => ({
+        id: c.id,
         dueAt: c.dueAt.toISOString(),
         status: c.status,
         note: c.note,
@@ -187,12 +244,26 @@ export async function setContactStage(input: unknown): Promise<Result> {
   const me = await requireOwner();
   const p = setStageSchema.safeParse(input);
   if (!p.success) return { ok: false, error: "Invalid request." };
-  const before = await Contact.findOneAndUpdate(
-    { _id: p.data.id, stage: { $ne: p.data.stage } },
-    { stage: p.data.stage, stageChangedAt: new Date() },
-  ).lean();
-  if (before)
-    await audit({ actorId: me.id, action: "contact.stage", entity: "contacts", entityId: before._id, before: { stage: before.stage }, after: { stage: p.data.stage, via: "pipeline" } });
+  await db.transaction(async (tx) => {
+    const [before] = await tx
+      .select({ stage: contacts.stage })
+      .from(contacts)
+      .where(and(eq(contacts.id, p.data.id), ne(contacts.stage, p.data.stage)))
+      .for("update");
+    if (!before) return; // already there
+    await tx.update(contacts).set({ stage: p.data.stage, stageChangedAt: new Date() }).where(eq(contacts.id, p.data.id));
+    await audit(
+      {
+        actorId: me.id,
+        action: "contact.stage",
+        entity: "contacts",
+        entityId: p.data.id,
+        before: { stage: before.stage },
+        after: { stage: p.data.stage, via: "pipeline" },
+      },
+      tx,
+    );
+  });
   revalidatePath("/pipeline");
   return { ok: true };
 }

@@ -1,11 +1,10 @@
-import { Types } from "mongoose";
 import Link from "next/link";
 import { CampaignPicker } from "@/components/campaign-picker";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { visibleCampaigns } from "@/lib/contacts-query";
-import { Contact } from "@/lib/models/contact";
-import { User } from "@/lib/models/user";
+import { and, desc, eq } from "drizzle-orm";
+import { contacts, db, users } from "@/lib/db";
 import { stageCounts } from "@/lib/reports";
 import { requireOwner } from "@/lib/session";
 import { STAGES } from "@/lib/vocab";
@@ -32,21 +31,28 @@ export default async function PipelinePage({ searchParams }: { searchParams: Pro
     );
   const requested = (await searchParams).campaign;
   const campaign = campaigns.find((c) => c.id === requested) ?? campaigns[0];
-  const cid = new Types.ObjectId(campaign.id);
 
-  const [counts, columns, users] = await Promise.all([
+  const [counts, columns] = await Promise.all([
     stageCounts(campaign.id),
     Promise.all(
       STAGES.map((stage) =>
-        Contact.find({ campaignId: cid, stage }, { name: 1, phone: 1, assignedTo: 1, lastOutcome: 1, school: 1 })
-          .sort({ stageChangedAt: -1 })
-          .limit(PER_COLUMN)
-          .lean(),
+        db
+          .select({
+            id: contacts.id,
+            name: contacts.name,
+            phone: contacts.phone,
+            school: contacts.school,
+            lastOutcome: contacts.lastOutcome,
+            caller: users.name,
+          })
+          .from(contacts)
+          .leftJoin(users, eq(users.id, contacts.assignedTo))
+          .where(and(eq(contacts.campaignId, campaign.id), eq(contacts.stage, stage)))
+          .orderBy(desc(contacts.stageChangedAt))
+          .limit(PER_COLUMN),
       ),
     ),
-    User.find({ role: "caller" }, { name: 1 }).lean(),
   ]);
-  const names = new Map(users.map((u) => [String(u._id), u.name]));
 
   return (
     <>
@@ -57,15 +63,7 @@ export default async function PipelinePage({ searchParams }: { searchParams: Pro
         key={campaign.id}
         campaignId={campaign.id}
         counts={counts}
-        cards={columns.flatMap((column, i) => column.map((c) => ({
-          id: String(c._id),
-          name: c.name,
-          phone: c.phone,
-          school: c.school ?? "",
-          caller: c.assignedTo ? (names.get(String(c.assignedTo)) ?? "") : "",
-          lastOutcome: c.lastOutcome ?? null,
-          stage: STAGES[i],
-        })))}
+        cards={columns.flatMap((column, i) => column.map((c) => ({ ...c, caller: c.caller ?? "", stage: STAGES[i] })))}
       />
     </>
   );

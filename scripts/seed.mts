@@ -1,47 +1,40 @@
-// FICTIONAL development data. Refuses to run unless the database name ends in -dev or -test.
-import mongoose from "mongoose";
-import { connectDb } from "@/lib/db";
-import { Callback } from "@/lib/models/callback";
-import { Campaign } from "@/lib/models/campaign";
-import { Contact } from "@/lib/models/contact";
-import { Template } from "@/lib/models/template";
-import { User } from "@/lib/models/user";
-import { STAGES } from "@/lib/vocab";
+// FICTIONAL development data. Refuses to run unless the database is on this computer.
+import "./env.mts";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { db } from "@/lib/db";
+import { callbacks, campaignCallers, campaigns, contacts, templates, users } from "@/lib/db/schema";
 import { hashPassword } from "@/lib/password";
+import { STAGES } from "@/lib/vocab";
 
-try {
-  process.loadEnvFile(".env.local");
-} catch {}
-
-const uri = process.env.MONGODB_URI ?? "";
-const dbName = new URL(uri.replace(/^mongodb(\+srv)?:/, "http:")).pathname.slice(1);
-if (!/-(dev|test)$/.test(dbName) || process.env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production") {
-  console.error(`Refusing to seed database "${dbName}". Seeding only runs on databases named *-dev or *-test.`);
+const url = new URL(process.env.DATABASE_URL ?? "postgres://missing");
+if (!["127.0.0.1", "localhost"].includes(url.hostname) || process.env.NODE_ENV === "production") {
+  console.error(`Refusing to seed ${url.hostname}. Seeding only runs against a local database (npm run db:dev).`);
   process.exit(1);
 }
 
 const PASSWORD = "fictional-dev-pw";
-const users = [
+const people = [
   { name: "Test Owner (FICTIONAL)", email: "owner@example.test", role: "owner" },
   { name: "Nimali Test (FICTIONAL)", email: "nimali@example.test", role: "caller", phone: "0710000001" },
   { name: "Kasun Test (FICTIONAL)", email: "kasun@example.test", role: "caller", phone: "0770000002" },
 ] as const;
 
-await connectDb();
 const passwordHash = await hashPassword(PASSWORD);
-for (const u of users) {
-  await User.updateOne(
-    { email: u.email },
-    { $setOnInsert: { ...u, passwordHash, mustChangePassword: false } },
-    { upsert: true },
-  );
-}
+await db
+  .insert(users)
+  .values(people.map((u) => ({ ...u, passwordHash, mustChangePassword: false })))
+  .onConflictDoNothing({ target: users.email });
+const byEmail = (email: string) => db.select().from(users).where(eq(users.email, email)).then((r) => r[0]);
+const nimali = await byEmail("nimali@example.test");
+const kasun = await byEmail("kasun@example.test");
 
-const [nimali, kasun] = await User.find({ email: { $in: ["nimali@example.test", "kasun@example.test"] } }).sort({ email: -1 });
-const campaign = await Campaign.findOneAndUpdate(
-  { name: "October intake (FICTIONAL)" },
-  {
-    $setOnInsert: {
+const CAMPAIGN = "October intake (FICTIONAL)";
+let [campaign] = await db.select().from(campaigns).where(eq(campaigns.name, CAMPAIGN));
+if (!campaign) {
+  [campaign] = await db
+    .insert(campaigns)
+    .values({
+      name: CAMPAIGN,
       classLabel: "2027 A/L Theory",
       startDate: "2026-10-01",
       endDate: "2026-12-31",
@@ -49,40 +42,39 @@ const campaign = await Campaign.findOneAndUpdate(
       dailyCallTarget: 40,
       enrollmentTarget: 25,
       script: "Hello, this is {caller} from Pasindu Athukorala ICT class. (FICTIONAL script)",
-      callers: [{ userId: nimali._id }, { userId: kasun._id, dailyCallTarget: 30 }],
-    },
-  },
-  { upsert: true, returnDocument: "after" },
-);
+      fee: "Rs. 2,500 / month (FICTIONAL)",
+      link: "https://example.test/join",
+    })
+    .returning();
+  await db.insert(campaignCallers).values([
+    { campaignId: campaign.id, userId: nimali.id, position: 0 },
+    { campaignId: campaign.id, userId: kasun.id, dailyCallTarget: 30, position: 1 },
+  ]);
+}
+
 const schools = ["Test College A", "Test Vidyalaya B", "Sample MV C"];
 const districts = ["Colombo", "Gampaha", "Kandy", "Galle", "Kurunegala"];
-await Contact.bulkWrite(
-  Array.from({ length: 60 }, (_, i) => ({
-    updateOne: {
-      filter: { campaignId: campaign._id, phone: `07100${String(i).padStart(5, "0")}` },
-      update: {
-        $setOnInsert: {
-          name: `Test Student ${String(i + 1).padStart(2, "0")} (FICTIONAL)`,
-          school: schools[i % 3],
-          district: districts[i % 5],
-          gradeOrBatch: "2027 A/L",
-          source: i % 2 ? "Facebook ad" : "Seminar",
-          tags: i % 7 === 0 ? ["revision"] : [],
-          assignedTo: i % 10 === 9 ? null : i % 2 ? nimali._id : kasun._id,
-          stage: STAGES[i % 5 === 0 ? i % STAGES.length : 0],
-        },
-      },
-      upsert: true,
-    },
-  })),
-);
+await db
+  .insert(contacts)
+  .values(
+    Array.from({ length: 60 }, (_, i) => ({
+      campaignId: campaign.id,
+      phone: `07100${String(i).padStart(5, "0")}`,
+      name: `Test Student ${String(i + 1).padStart(2, "0")} (FICTIONAL)`,
+      school: schools[i % 3],
+      district: districts[i % 5],
+      gradeOrBatch: "2027 A/L",
+      source: i % 2 ? "Facebook ad" : "Seminar",
+      tags: i % 7 === 0 ? ["revision"] : [],
+      assignedTo: i % 10 === 9 ? null : i % 2 ? nimali.id : kasun.id,
+      stage: STAGES[i % 5 === 0 ? i % STAGES.length : 0],
+      // Spread creation times so "oldest first" orders are stable and realistic.
+      createdAt: new Date(Date.UTC(2026, 8, 1) + i * 60_000),
+    })),
+  )
+  .onConflictDoNothing({ target: [contacts.campaignId, contacts.phone] });
 
-await Campaign.updateOne(
-  { _id: campaign._id, fee: { $in: [null, ""] } },
-  { fee: "Rs. 2,500 / month (FICTIONAL)", link: "https://example.test/join" },
-);
-
-const templates = [
+const texts = [
   {
     name: "Class details (FICTIONAL)",
     language: "en",
@@ -114,7 +106,11 @@ const templates = [
     body: "ආයුබෝවන් {name}, {class} පන්තිය {start_date} දින ආරම්භ වන බව සිහිපත් කරමු. ප්‍රශ්න ඇත්නම් මෙහි පිළිතුරු දෙන්න.\n— {caller} (TEST)",
   },
 ] as const;
-for (const t of templates) await Template.updateOne({ name: t.name }, { $setOnInsert: t }, { upsert: true });
+const existing = new Set(
+  (await db.select({ name: templates.name }).from(templates).where(inArray(templates.name, texts.map((t) => t.name)))).map((t) => t.name),
+);
+const missing = texts.filter((t) => !existing.has(t.name));
+if (missing.length) await db.insert(templates).values([...missing]);
 
 // Two callbacks for Nimali so "Today" and calling mode have something to show.
 const now = Date.now();
@@ -122,14 +118,24 @@ for (const [phone, dueAt, note] of [
   ["0710000001", new Date(now - 3600_000), "Asked to call after school (FICTIONAL)"],
   ["0710000003", new Date(now + 2 * 3600_000), "Parent will be home (FICTIONAL)"],
 ] as const) {
-  const c = await Contact.findOne({ campaignId: campaign._id, phone });
-  if (c && !(await Callback.exists({ contactId: c._id, status: "pending" }))) {
-    await Callback.create({ campaignId: campaign._id, contactId: c._id, callerId: c.assignedTo, dueAt, note, history: [{ action: "created", dueAt }] });
-    await Contact.updateOne({ _id: c._id }, { nextCallbackAt: dueAt });
-  }
+  const [c] = await db.select().from(contacts).where(and(eq(contacts.campaignId, campaign.id), eq(contacts.phone, phone)));
+  if (!c) continue;
+  const inserted = await db
+    .insert(callbacks)
+    .values({
+      campaignId: campaign.id,
+      contactId: c.id,
+      callerId: c.assignedTo,
+      dueAt,
+      note,
+      history: [{ at: new Date().toISOString(), action: "created", dueAt: dueAt.toISOString() }],
+    })
+    .onConflictDoNothing({ target: callbacks.contactId, where: sql`status = 'pending'` })
+    .returning({ id: callbacks.id });
+  if (inserted.length) await db.update(contacts).set({ nextCallbackAt: dueAt }).where(eq(contacts.id, c.id));
 }
 
-console.log(`Seeded ${users.length} fictional users in "${dbName}". Password for all: ${PASSWORD}`);
-console.log(users.map((u) => `  ${u.role.padEnd(6)} ${u.email}`).join("\n"));
-console.log(`Seeded campaign "${campaign.name}" with 60 fictional contacts, 6 templates and 2 callbacks.`);
-await mongoose.disconnect();
+console.log(`Seeded ${people.length} fictional users on ${url.host}. Password for all: ${PASSWORD}`);
+console.log(people.map((u) => `  ${u.role.padEnd(6)} ${u.email}`).join("\n"));
+console.log(`Seeded campaign "${CAMPAIGN}" with 60 fictional contacts, ${texts.length} templates and 2 callbacks.`);
+await db.$client.end();

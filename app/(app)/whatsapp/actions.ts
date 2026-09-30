@@ -1,10 +1,8 @@
 "use server";
 
-import { Types } from "mongoose";
+import { and, desc, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-import { Contact } from "@/lib/models/contact";
-import { Template } from "@/lib/models/template";
-import { WhatsappLog } from "@/lib/models/whatsapp-log";
+import { contacts, db, templates, whatsappLogs } from "@/lib/db";
 import { whatsappSentSchema } from "@/lib/schemas";
 import { requireUser } from "@/lib/session";
 
@@ -17,27 +15,40 @@ export async function setWhatsappSent(input: unknown): Promise<Result> {
   if (!p.success) return { ok: false, error: "Invalid request." };
   const { contactId, templateId, sent } = p.data;
 
-  const contact = await Contact.findOne(
-    me.role === "owner" ? { _id: contactId } : { _id: contactId, assignedTo: new Types.ObjectId(me.id) },
-    { campaignId: 1 },
-  ).lean();
+  const [contact] = await db
+    .select({ campaignId: contacts.campaignId })
+    .from(contacts)
+    .where(and(eq(contacts.id, contactId), me.role === "owner" ? undefined : eq(contacts.assignedTo, me.id)));
   if (!contact) return { ok: false, error: "Contact not found." };
 
-  if (sent) {
-    const template = templateId ? await Template.findById(templateId, { name: 1 }).lean() : null;
-    await WhatsappLog.create({
-      campaignId: contact.campaignId,
-      contactId,
-      callerId: me.id,
-      templateId: template?._id,
-      templateName: template?.name ?? "",
-    });
-  } else {
-    const latest = await WhatsappLog.findOne({ contactId, callerId: me.id }).sort({ sentAt: -1 });
-    if (latest) await latest.deleteOne();
-  }
-  const last = await WhatsappLog.findOne({ contactId }, { sentAt: 1 }).sort({ sentAt: -1 }).lean();
-  await Contact.updateOne({ _id: contactId }, { lastWhatsappAt: last?.sentAt ?? null });
+  const last = await db.transaction(async (tx) => {
+    if (sent) {
+      const [template] = templateId ? await tx.select({ id: templates.id, name: templates.name }).from(templates).where(eq(templates.id, templateId)) : [];
+      await tx.insert(whatsappLogs).values({
+        campaignId: contact.campaignId,
+        contactId,
+        callerId: me.id,
+        templateId: template?.id ?? null,
+        templateName: template?.name ?? "",
+      });
+    } else {
+      const [latest] = await tx
+        .select({ id: whatsappLogs.id })
+        .from(whatsappLogs)
+        .where(and(eq(whatsappLogs.contactId, contactId), eq(whatsappLogs.callerId, me.id)))
+        .orderBy(desc(whatsappLogs.sentAt))
+        .limit(1);
+      if (latest) await tx.delete(whatsappLogs).where(eq(whatsappLogs.id, latest.id));
+    }
+    const [newest] = await tx
+      .select({ sentAt: whatsappLogs.sentAt })
+      .from(whatsappLogs)
+      .where(eq(whatsappLogs.contactId, contactId))
+      .orderBy(desc(whatsappLogs.sentAt))
+      .limit(1);
+    await tx.update(contacts).set({ lastWhatsappAt: newest?.sentAt ?? null }).where(eq(contacts.id, contactId));
+    return newest?.sentAt ?? null;
+  });
   revalidatePath("/whatsapp");
-  return { ok: true, lastWhatsappAt: last?.sentAt.toISOString() ?? null };
+  return { ok: true, lastWhatsappAt: last?.toISOString() ?? null };
 }

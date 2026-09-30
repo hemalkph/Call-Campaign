@@ -1,5 +1,6 @@
 import { PageHeader } from "@/components/page-header";
-import { User } from "@/lib/models/user";
+import { asc, desc } from "drizzle-orm";
+import { db, users as usersTable } from "@/lib/db";
 import { requireOwner } from "@/lib/session";
 import { CreateUserDialog, UsersTable } from "./users-table";
 
@@ -7,7 +8,10 @@ export const metadata = { title: "Users" };
 
 export default async function UsersPage() {
   const me = await requireOwner();
-  const users = await User.find({}, { passwordHash: 0 }).sort({ active: -1, role: -1, name: 1 }).lean();
+  const users = await db
+    .select()
+    .from(usersTable)
+    .orderBy(desc(usersTable.active), asc(usersTable.role), asc(usersTable.name)); // active first, owners before callers
 
   return (
     <>
@@ -17,7 +21,7 @@ export default async function UsersPage() {
       <UsersTable
         currentUserId={me.id}
         users={users.map((u) => ({
-          id: String(u._id),
+          id: u.id,
           name: u.name,
           email: u.email,
           phone: u.phone ?? "",

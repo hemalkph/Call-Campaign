@@ -1,19 +1,12 @@
 // Dashboard and report numbers, computed at read time (no background jobs).
-import { Types } from "mongoose";
+import { and, asc, count, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
 import { OPEN_STAGES, REACHED_OUTCOMES } from "./calling";
-import { Call } from "./models/call";
-import { Callback } from "./models/callback";
-import { Campaign } from "./models/campaign";
-import { Contact } from "./models/contact";
-import { User } from "./models/user";
-import { WhatsappLog } from "./models/whatsapp-log";
+import { callbacks, calls, campaignCallers, campaigns, contacts, db, users, whatsappLogs } from "./db";
 import { dayBounds, TZ } from "./time";
 import { STAGES, type Stage } from "./vocab";
 
-const oid = (id: string) => new Types.ObjectId(id);
-type Counted = { _id: Types.ObjectId | null; [k: string]: unknown };
-const byId = <T extends Counted>(rows: T[]) => new Map(rows.map((r) => [String(r._id), r]));
-const reached = { $cond: [{ $in: ["$outcome", REACHED_OUTCOMES] }, 1, 0] };
+/** count(*) filter (where …) as a JS number. */
+const countIf = (cond: ReturnType<typeof sql> | undefined) => sql<number>`(count(*) filter (where ${cond}))::int`;
 
 export type CallerRow = {
   callerId: string;
@@ -33,57 +26,63 @@ export type CallerRow = {
 };
 
 export async function callerPerformance(campaignId: string, now = new Date()): Promise<CallerRow[]> {
-  const campaign = await Campaign.findById(campaignId, { callers: 1, dailyCallTarget: 1 }).lean();
+  const [campaign] = await db.select({ dailyCallTarget: campaigns.dailyCallTarget }).from(campaigns).where(eq(campaigns.id, campaignId));
   if (!campaign) return [];
-  const cid = oid(campaignId);
   const { start } = dayBounds(now);
+  const reached = inArray(calls.outcome, REACHED_OUTCOMES);
 
-  const [calls, contacts, callbacks, whatsapp] = await Promise.all([
-    Call.aggregate<Counted & { calls: number; reached: number; callsToday: number; reachedToday: number }>([
-      { $match: { campaignId: cid } },
-      {
-        $group: {
-          _id: "$callerId",
-          calls: { $sum: 1 },
-          reached: { $sum: reached },
-          callsToday: { $sum: { $cond: [{ $gte: ["$calledAt", start] }, 1, 0] } },
-          reachedToday: { $sum: { $cond: [{ $and: [{ $gte: ["$calledAt", start] }, { $in: ["$outcome", REACHED_OUTCOMES] }] }, 1, 0] } },
-        },
-      },
-    ]),
-    Contact.aggregate<Counted & { contacts: number; open: number; interested: number; enrolled: number }>([
-      { $match: { campaignId: cid } },
-      {
-        $group: {
-          _id: "$assignedTo",
-          contacts: { $sum: 1 },
-          open: { $sum: { $cond: [{ $in: ["$stage", OPEN_STAGES] }, 1, 0] } },
-          interested: { $sum: { $cond: [{ $in: ["$stage", ["interested", "payment_details_sent"]] }, 1, 0] } },
-          enrolled: { $sum: { $cond: [{ $eq: ["$stage", "enrolled"] }, 1, 0] } },
-        },
-      },
-    ]),
-    Callback.aggregate<Counted & { pending: number; overdue: number }>([
-      { $match: { campaignId: cid, status: "pending" } },
-      { $group: { _id: "$callerId", pending: { $sum: 1 }, overdue: { $sum: { $cond: [{ $lt: ["$dueAt", now] }, 1, 0] } } } },
-    ]),
-    WhatsappLog.aggregate<Counted & { n: number }>([{ $match: { campaignId: cid } }, { $group: { _id: "$callerId", n: { $sum: 1 } } }]),
+  const [onCampaign, callRows, contactRows, callbackRows, waRows] = await Promise.all([
+    db.select().from(campaignCallers).where(eq(campaignCallers.campaignId, campaignId)).orderBy(asc(campaignCallers.position)),
+    db
+      .select({
+        id: calls.callerId,
+        calls: sql<number>`count(*)::int`,
+        reached: countIf(reached),
+        callsToday: countIf(gte(calls.calledAt, start)),
+        reachedToday: countIf(and(gte(calls.calledAt, start), reached)),
+      })
+      .from(calls)
+      .where(eq(calls.campaignId, campaignId))
+      .groupBy(calls.callerId),
+    db
+      .select({
+        id: contacts.assignedTo,
+        contacts: sql<number>`count(*)::int`,
+        open: countIf(inArray(contacts.stage, OPEN_STAGES)),
+        interested: countIf(inArray(contacts.stage, ["interested", "payment_details_sent"])),
+        enrolled: countIf(eq(contacts.stage, "enrolled")),
+      })
+      .from(contacts)
+      .where(eq(contacts.campaignId, campaignId))
+      .groupBy(contacts.assignedTo),
+    db
+      .select({ id: callbacks.callerId, pending: sql<number>`count(*)::int`, overdue: countIf(lt(callbacks.dueAt, now)) })
+      .from(callbacks)
+      .where(and(eq(callbacks.campaignId, campaignId), eq(callbacks.status, "pending")))
+      .groupBy(callbacks.callerId),
+    db
+      .select({ id: whatsappLogs.callerId, n: sql<number>`count(*)::int` })
+      .from(whatsappLogs)
+      .where(eq(whatsappLogs.campaignId, campaignId))
+      .groupBy(whatsappLogs.callerId),
   ]);
 
   // Callers on the campaign, plus anyone removed from it who still has calls or contacts.
-  const ids = [...new Set([...campaign.callers.map((c) => String(c.userId)), ...calls.map((c) => String(c._id)), ...contacts.filter((c) => c._id).map((c) => String(c._id))])];
-  const users = await User.find({ _id: { $in: ids } }, { name: 1 }).lean();
-  const [callMap, contactMap, cbMap, waMap] = [byId(calls), byId(contacts), byId(callbacks), byId(whatsapp)];
+  const ids = [
+    ...new Set([...onCampaign.map((c) => c.userId), ...callRows.map((c) => c.id), ...contactRows.flatMap((c) => (c.id ? [c.id] : []))]),
+  ];
+  const names = ids.length ? await db.select({ id: users.id, name: users.name }).from(users).where(inArray(users.id, ids)) : [];
+  const find = <T extends { id: string | null }>(rows: T[], id: string) => rows.find((r) => r.id === id);
 
   return ids.map((id) => {
-    const cl = callMap.get(id);
-    const ct = contactMap.get(id);
-    const cb = cbMap.get(id);
-    const onCampaign = campaign.callers.find((c) => String(c.userId) === id);
+    const cl = find(callRows, id);
+    const ct = find(contactRows, id);
+    const cb = find(callbackRows, id);
+    const member = onCampaign.find((c) => c.userId === id);
     return {
       callerId: id,
-      name: users.find((u) => String(u._id) === id)?.name ?? "Unknown",
-      target: onCampaign ? (onCampaign.dailyCallTarget ?? campaign.dailyCallTarget) : 0,
+      name: names.find((u) => u.id === id)?.name ?? "Unknown",
+      target: member ? (member.dailyCallTarget ?? campaign.dailyCallTarget) : 0,
       callsToday: cl?.callsToday ?? 0,
       reachedToday: cl?.reachedToday ?? 0,
       calls: cl?.calls ?? 0,
@@ -94,40 +93,43 @@ export async function callerPerformance(campaignId: string, now = new Date()): P
       enrolled: ct?.enrolled ?? 0,
       pendingCallbacks: cb?.pending ?? 0,
       overdueCallbacks: cb?.overdue ?? 0,
-      whatsapp: waMap.get(id)?.n ?? 0,
+      whatsapp: find(waRows, id)?.n ?? 0,
     };
   });
 }
 
 export async function stageCounts(campaignId: string): Promise<Record<Stage, number>> {
-  const rows = await Contact.aggregate<{ _id: Stage; n: number }>([
-    { $match: { campaignId: oid(campaignId) } },
-    { $group: { _id: "$stage", n: { $sum: 1 } } },
-  ]);
-  return Object.fromEntries(STAGES.map((s) => [s, rows.find((r) => r._id === s)?.n ?? 0])) as Record<Stage, number>;
+  const rows = await db
+    .select({ stage: contacts.stage, n: count() })
+    .from(contacts)
+    .where(eq(contacts.campaignId, campaignId))
+    .groupBy(contacts.stage);
+  return Object.fromEntries(STAGES.map((s) => [s, rows.find((r) => r.stage === s)?.n ?? 0])) as Record<Stage, number>;
 }
 
 export async function topSources(campaignId: string, limit = 8) {
-  const rows = await Contact.aggregate<{ _id: string | null; total: number; enrolled: number }>([
-    { $match: { campaignId: oid(campaignId) } },
-    { $group: { _id: { $ifNull: ["$source", ""] }, total: { $sum: 1 }, enrolled: { $sum: { $cond: [{ $eq: ["$stage", "enrolled"] }, 1, 0] } } } },
-    { $sort: { total: -1, _id: 1 } },
-    { $limit: limit },
-  ]);
-  return rows.map((r) => ({ source: r._id || "", total: r.total, enrolled: r.enrolled }));
+  return db
+    .select({ source: contacts.source, total: sql<number>`count(*)::int`, enrolled: countIf(eq(contacts.stage, "enrolled")) })
+    .from(contacts)
+    .where(eq(contacts.campaignId, campaignId))
+    .groupBy(contacts.source)
+    .orderBy(desc(sql`count(*)`), asc(contacts.source))
+    .limit(limit);
 }
 
 /** Calls per Sri Lankan day for the last `days` days (oldest first), split into reached / not reached. */
 export async function dailyCalls(campaignId: string, days = 14, now = new Date()) {
   const { start } = dayBounds(now);
   const from = new Date(start.getTime() - (days - 1) * 86_400_000);
-  const rows = await Call.aggregate<{ _id: string; total: number; reached: number }>([
-    { $match: { campaignId: oid(campaignId), calledAt: { $gte: from } } },
-    { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$calledAt", timezone: TZ } }, total: { $sum: 1 }, reached: { $sum: reached } } },
-  ]);
+  const day = sql<string>`to_char(${calls.calledAt} at time zone ${sql.raw(`'${TZ}'`)}, 'YYYY-MM-DD')`; // literal: GROUP BY must match it exactly
+  const rows = await db
+    .select({ day, total: sql<number>`count(*)::int`, reached: countIf(inArray(calls.outcome, REACHED_OUTCOMES)) })
+    .from(calls)
+    .where(and(eq(calls.campaignId, campaignId), gte(calls.calledAt, from)))
+    .groupBy(day);
   return Array.from({ length: days }, (_, i) => {
-    const day = new Date(from.getTime() + i * 86_400_000 + 12 * 3600_000).toLocaleDateString("en-CA", { timeZone: TZ });
-    const r = rows.find((x) => x._id === day);
-    return { day, reached: r?.reached ?? 0, notReached: (r?.total ?? 0) - (r?.reached ?? 0) };
+    const d = new Date(from.getTime() + i * 86_400_000 + 12 * 3600_000).toLocaleDateString("en-CA", { timeZone: TZ });
+    const r = rows.find((x) => x.day === d);
+    return { day: d, reached: r?.reached ?? 0, notReached: (r?.total ?? 0) - (r?.reached ?? 0) };
   });
 }

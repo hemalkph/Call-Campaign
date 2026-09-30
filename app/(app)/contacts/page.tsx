@@ -2,7 +2,8 @@ import Link from "next/link";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { filterOptions, listContacts, PAGE_SIZE, parseListParams, visibleCampaigns } from "@/lib/contacts-query";
-import { User } from "@/lib/models/user";
+import { eq } from "drizzle-orm";
+import { db, users } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { ContactsView } from "./contacts-view";
 
@@ -34,12 +35,12 @@ export default async function ContactsPage({ searchParams }: { searchParams: Pro
     );
 
   const campaign = campaigns.find((c) => c.id === params.campaign) ?? campaigns[0];
-  const [{ rows, total }, options, users] = await Promise.all([
+  const [{ rows, total }, options, callerRows] = await Promise.all([
     listContacts(user, campaign.id, params),
     filterOptions(user, campaign.id),
-    user.role === "owner" ? User.find({ role: "caller" }, { name: 1 }).lean() : Promise.resolve([]),
+    user.role === "owner" ? db.select({ id: users.id, name: users.name }).from(users).where(eq(users.role, "caller")) : Promise.resolve([]),
   ]);
-  const userNames = Object.fromEntries(users.map((u) => [String(u._id), u.name]));
+  const userNames = Object.fromEntries(callerRows.map((u) => [u.id, u.name]));
 
   return (
     <>
@@ -55,20 +56,20 @@ export default async function ContactsPage({ searchParams }: { searchParams: Pro
         callers={campaign.callerIds.map((id) => ({ id, name: userNames[id] ?? "Unknown" }))}
         userNames={userNames}
         rows={rows.map((c) => ({
-          id: String(c._id),
+          id: c.id,
           name: c.name,
           phone: c.phone,
           altPhone: c.altPhone ?? "",
-          school: c.school ?? "",
-          district: c.district ?? "",
-          gradeOrBatch: c.gradeOrBatch ?? "",
-          source: c.source ?? "",
+          school: c.school,
+          district: c.district,
+          gradeOrBatch: c.gradeOrBatch,
+          source: c.source,
           tags: c.tags,
           notes: c.notes,
-          assignedTo: c.assignedTo ? String(c.assignedTo) : null,
+          assignedTo: c.assignedTo,
           stage: c.stage,
           lastCallAt: c.lastCallAt?.toISOString() ?? null,
-          lastOutcome: c.lastOutcome ?? null,
+          lastOutcome: c.lastOutcome,
           nextCallbackAt: c.nextCallbackAt?.toISOString() ?? null,
           createdAt: c.createdAt.toISOString(),
         }))}

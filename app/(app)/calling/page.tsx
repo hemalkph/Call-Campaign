@@ -2,9 +2,9 @@ import Link from "next/link";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { activeCampaignsFor } from "@/lib/contacts-query";
-import { Call } from "@/lib/models/call";
-import { Contact } from "@/lib/models/contact";
-import { Template } from "@/lib/models/template";
+import { and, asc, count, eq, gte } from "drizzle-orm";
+import { calls, contacts, db, templates as templatesTable } from "@/lib/db";
+import { recordId } from "@/lib/schemas";
 import { findNextContact, toCard } from "@/lib/next-contact";
 import { requireUser } from "@/lib/session";
 import { dayBounds } from "@/lib/time";
@@ -27,14 +27,21 @@ export default async function CallingPage({ searchParams }: { searchParams: Prom
     );
 
   const campaign = campaigns.find((c) => c.id === sp.campaign) ?? campaigns[0];
-  const chosen = /^[a-f\d]{24}$/i.test(sp.contact ?? "")
-    ? await Contact.findOne({ _id: sp.contact, campaignId: campaign.id, assignedTo: me.id }).lean()
-    : null;
+  const contactId = recordId.safeParse(sp.contact);
+  const [chosen] = contactId.success
+    ? await db
+        .select()
+        .from(contacts)
+        .where(and(eq(contacts.id, contactId.data), eq(contacts.campaignId, campaign.id), eq(contacts.assignedTo, me.id)))
+    : [];
   const next = chosen ? { contact: chosen, reason: "chosen" as const } : await findNextContact(me.id, campaign.id);
-  const [card, callsToday, templates] = await Promise.all([
+  const [card, [{ callsToday }], templates] = await Promise.all([
     next ? toCard(next.contact, next.reason) : null,
-    Call.countDocuments({ callerId: me.id, campaignId: campaign.id, calledAt: { $gte: dayBounds().start } }),
-    Template.find().sort({ language: 1, name: 1 }).lean(),
+    db
+      .select({ callsToday: count() })
+      .from(calls)
+      .where(and(eq(calls.callerId, me.id), eq(calls.campaignId, campaign.id), gte(calls.calledAt, dayBounds().start))),
+    db.select().from(templatesTable).orderBy(asc(templatesTable.language), asc(templatesTable.name)),
   ]);
 
   return (
@@ -45,7 +52,7 @@ export default async function CallingPage({ searchParams }: { searchParams: Prom
       campaign={campaign}
       initialCard={card}
       callsToday={callsToday}
-      templates={templates.map((t) => ({ id: String(t._id), name: t.name, language: t.language, body: t.body }))}
+      templates={templates.map((t) => ({ id: t.id, name: t.name, language: t.language, body: t.body }))}
       emptyAction={
         <Button asChild variant="outline">
           <Link href="/today">Back to Today</Link>

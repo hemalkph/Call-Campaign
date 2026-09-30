@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import "@/test/mongo";
+import "@/test/db";
 import { clear, hit } from "./rate-limit";
 
 it("allows `limit` hits per window, then blocks until cleared", async () => {
