@@ -1,30 +1,36 @@
 "use server";
 
-import { Types } from "mongoose";
+import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
+import { audit } from "@/lib/audit";
 import { closeCallback, type CallbackUndo, scheduleCallback, undoCallbackChange } from "@/lib/callbacks";
 import { stageAfter } from "@/lib/calling";
-import { audit } from "@/lib/models/audit-event";
-import { Call } from "@/lib/models/call";
-import { Campaign } from "@/lib/models/campaign";
-import { Contact } from "@/lib/models/contact";
+import { calls, campaignCallers, campaigns, contacts, db } from "@/lib/db";
+import { isUniqueViolation } from "@/lib/db/tx";
 import { type ContactCard, findNextContact, toCard } from "@/lib/next-contact";
-import { logCallSchema, objectId } from "@/lib/schemas";
+import { logCallSchema, recordId } from "@/lib/schemas";
 import { type CurrentUser, requireUser } from "@/lib/session";
 
 type Result<T = object> = ({ ok: true } & T) | { ok: false; error: string };
+type ContactUndo = {
+  stage: string;
+  stageChangedAt: string;
+  lastCallAt: string | null;
+  lastOutcome: string | null;
+  nextCallbackAt: string | null;
+};
 
 const UNDO_WINDOW_MS = 30_000; // the screen offers 10 s; the rest is slack for slow connections
 
 /** Contacts a user may log calls for: their own; owners may log for anyone. */
 const contactScope = (me: CurrentUser, id: string) =>
-  me.role === "owner" ? { _id: id } : { _id: id, assignedTo: new Types.ObjectId(me.id) };
+  me.role === "owner" ? eq(contacts.id, id) : and(eq(contacts.id, id), eq(contacts.assignedTo, me.id));
 
 const nextSchema = z.strictObject({
-  campaignId: objectId,
-  skip: z.array(objectId).max(500),
-  contactId: objectId.optional(),
+  campaignId: recordId,
+  skip: z.array(recordId).max(500),
+  contactId: recordId.optional(),
 });
 
 export async function getNextContact(input: unknown): Promise<Result<{ card: ContactCard | null }>> {
@@ -32,17 +38,22 @@ export async function getNextContact(input: unknown): Promise<Result<{ card: Con
   const p = nextSchema.safeParse(input);
   if (!p.success) return { ok: false, error: "Invalid request." };
   const { campaignId, skip, contactId } = p.data;
-  if (!(await Campaign.exists({ _id: campaignId, status: "active", "callers.userId": new Types.ObjectId(me.id) })))
-    return { ok: false, error: "You're not on this campaign, or it isn't active." };
+  const [member] = await db
+    .select({ id: campaigns.id })
+    .from(campaigns)
+    .innerJoin(campaignCallers, and(eq(campaignCallers.campaignId, campaigns.id), eq(campaignCallers.userId, me.id)))
+    .where(and(eq(campaigns.id, campaignId), eq(campaigns.status, "active")));
+  if (!member) return { ok: false, error: "You're not on this campaign, or it isn't active." };
 
   if (contactId) {
-    const contact = await Contact.findOne({ ...contactScope(me, contactId), campaignId }).lean();
+    const [contact] = await db.select().from(contacts).where(and(contactScope(me, contactId), eq(contacts.campaignId, campaignId)));
     if (contact) return { ok: true, card: await toCard(contact, "chosen") };
   }
   const next = await findNextContact(me.id, campaignId, skip);
   return { ok: true, card: next ? await toCard(next.contact, next.reason) : null };
 }
 
+/** Logs a call. Everything it changes (call, contact, callback, audit) is saved together or not at all. */
 export async function logCall(input: unknown): Promise<Result<{ callId: string }>> {
   const me = await requireUser();
   const p = logCallSchema.safeParse(input);
@@ -58,79 +69,108 @@ export async function logCall(input: unknown): Promise<Result<{ callId: string }
     if (dueAt.getTime() > now.getTime() + 366 * 86_400_000) return { ok: false, error: "The callback is more than a year away." };
   }
 
-  const contact = await Contact.findOne(contactScope(me, contactId)).lean();
-  if (!contact) return { ok: false, error: "Contact not found." };
-
-  let callback: CallbackUndo = {};
   try {
-    callback = dueAt
-      ? await scheduleCallback(contact, me.id, dueAt, callbackNote)
-      : await closeCallback(contact._id, me.id, "done"); // calling back completes a pending callback
+    const callId = await db.transaction(async (tx) => {
+      const [contact] = await tx.select().from(contacts).where(contactScope(me, contactId)).for("update");
+      if (!contact) return null;
+
+      const callback: CallbackUndo = dueAt
+        ? await scheduleCallback(contact, me.id, dueAt, callbackNote, tx)
+        : await closeCallback(contact.id, me.id, "done", undefined, tx); // calling back completes a pending callback
+
+      const before: ContactUndo = {
+        stage: contact.stage,
+        stageChangedAt: contact.stageChangedAt.toISOString(),
+        lastCallAt: contact.lastCallAt?.toISOString() ?? null,
+        lastOutcome: contact.lastOutcome,
+        nextCallbackAt: contact.nextCallbackAt?.toISOString() ?? null,
+      };
+      const stage = stageAfter(contact.stage, outcome);
+      const [call] = await tx
+        .insert(calls)
+        .values({
+          campaignId: contact.campaignId,
+          contactId: contact.id,
+          callerId: me.id,
+          calledAt: now,
+          outcome,
+          durationSec,
+          notes,
+          undo: { contact: before, callback },
+        })
+        .returning({ id: calls.id });
+      await tx
+        .update(contacts)
+        .set({ lastCallAt: now, lastOutcome: outcome, ...(stage !== contact.stage ? { stage, stageChangedAt: now } : {}) })
+        .where(eq(contacts.id, contact.id));
+      if (stage !== contact.stage)
+        await audit(
+          {
+            actorId: me.id,
+            action: "contact.stage",
+            entity: "contacts",
+            entityId: contact.id,
+            before: { stage: contact.stage },
+            after: { stage, via: "call", callId: call.id },
+          },
+          tx,
+        );
+      return call.id;
+    });
+    if (!callId) return { ok: false, error: "Contact not found." };
+    revalidatePath("/today");
+    return { ok: true, callId };
   } catch (e) {
-    if ((e as { code?: number }).code === 11000) return { ok: false, error: "This contact was just updated. Try again." };
+    if (isUniqueViolation(e)) return { ok: false, error: "This contact was just updated. Try again." };
     throw e;
   }
-
-  const before = {
-    stage: contact.stage,
-    stageChangedAt: contact.stageChangedAt,
-    lastCallAt: contact.lastCallAt,
-    lastOutcome: contact.lastOutcome,
-    nextCallbackAt: contact.nextCallbackAt,
-  };
-  const stage = stageAfter(contact.stage, outcome);
-  const call = await Call.create({
-    campaignId: contact.campaignId,
-    contactId: contact._id,
-    callerId: me.id,
-    calledAt: now,
-    outcome,
-    durationSec,
-    notes,
-    undo: { contact: before, callback },
-  });
-  await Contact.updateOne(
-    { _id: contact._id },
-    { lastCallAt: now, lastOutcome: outcome, ...(stage !== contact.stage ? { stage, stageChangedAt: now } : {}) },
-  );
-  if (stage !== contact.stage)
-    await audit({
-      actorId: me.id,
-      action: "contact.stage",
-      entity: "contacts",
-      entityId: contact._id,
-      before: { stage: contact.stage },
-      after: { stage, via: "call", callId: String(call._id) },
-    });
-
-  revalidatePath("/today");
-  return { ok: true, callId: String(call._id) };
 }
 
 export async function undoCall(input: unknown): Promise<Result<{ contactId: string }>> {
   const me = await requireUser();
-  const id = objectId.safeParse(input);
+  const id = recordId.safeParse(input);
   if (!id.success) return { ok: false, error: "Invalid request." };
-  const call = await Call.findOne({ _id: id.data, callerId: me.id }).select("+undo");
-  if (!call) return { ok: false, error: "That call was already undone." };
-  if (Date.now() - call.calledAt.getTime() > UNDO_WINDOW_MS) return { ok: false, error: "Too late to undo this call." };
 
-  const undo = call.undo as { contact: Record<string, unknown>; callback?: CallbackUndo };
-  const current = await Contact.findById(call.contactId, { stage: 1 }).lean();
-  await Contact.updateOne({ _id: call.contactId }, { $set: undo.contact });
-  await undoCallbackChange(undo.callback);
-  await Call.deleteOne({ _id: call._id });
-  await audit({ actorId: me.id, action: "call.undo", entity: "calls", entityId: call._id, after: { outcome: call.outcome } });
-  if (current && current.stage !== undo.contact.stage)
-    await audit({
-      actorId: me.id,
-      action: "contact.stage",
-      entity: "contacts",
-      entityId: call.contactId,
-      before: { stage: current.stage },
-      after: { stage: undo.contact.stage, via: "undo" },
-    });
+  const result = await db.transaction(async (tx): Promise<Result<{ contactId: string }>> => {
+    const [call] = await tx
+      .select()
+      .from(calls)
+      .where(and(eq(calls.id, id.data), eq(calls.callerId, me.id)))
+      .for("update");
+    if (!call) return { ok: false, error: "That call was already undone." };
+    if (Date.now() - call.calledAt.getTime() > UNDO_WINDOW_MS) return { ok: false, error: "Too late to undo this call." };
 
-  revalidatePath("/today");
-  return { ok: true, contactId: String(call.contactId) };
+    const undo = call.undo as { contact: ContactUndo; callback?: CallbackUndo };
+    const [current] = await tx.select({ stage: contacts.stage }).from(contacts).where(eq(contacts.id, call.contactId));
+    const date = (s: string | null) => (s ? new Date(s) : null);
+    await tx
+      .update(contacts)
+      .set({
+        stage: undo.contact.stage as typeof contacts.$inferInsert.stage,
+        stageChangedAt: new Date(undo.contact.stageChangedAt),
+        lastCallAt: date(undo.contact.lastCallAt),
+        lastOutcome: undo.contact.lastOutcome as typeof contacts.$inferInsert.lastOutcome,
+        nextCallbackAt: date(undo.contact.nextCallbackAt),
+      })
+      .where(eq(contacts.id, call.contactId));
+    await undoCallbackChange(undo.callback, tx);
+    await tx.delete(calls).where(eq(calls.id, call.id));
+    await audit({ actorId: me.id, action: "call.undo", entity: "calls", entityId: call.id, after: { outcome: call.outcome } }, tx);
+    if (current && current.stage !== undo.contact.stage)
+      await audit(
+        {
+          actorId: me.id,
+          action: "contact.stage",
+          entity: "contacts",
+          entityId: call.contactId,
+          before: { stage: current.stage },
+          after: { stage: undo.contact.stage, via: "undo" },
+        },
+        tx,
+      );
+    return { ok: true, contactId: call.contactId };
+  });
+
+  if (result.ok) revalidatePath("/today");
+  return result;
 }

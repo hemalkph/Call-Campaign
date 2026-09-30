@@ -1,52 +1,75 @@
-// Callback changes always go through here so contact.nextCallbackAt stays in step with
-// the (single) pending callback.
-import type { Types } from "mongoose";
-import { Callback } from "./models/callback";
-import { Contact } from "./models/contact";
+// Callback changes always go through here so contacts.next_callback_at stays in step with
+// the (single) pending callback. Pass a transaction to make a change part of a bigger one.
+import { and, eq, sql } from "drizzle-orm";
+import { type CallbackHistory, callbacks, contacts, db } from "./db";
+import type { Tx } from "./db/tx";
 
-type Id = string | Types.ObjectId;
-export type CallbackUndo = { createdId?: string; before?: Record<string, unknown> };
+type Callback = typeof callbacks.$inferSelect;
+export type CallbackUndo = { createdId?: string; before?: Callback };
+
+const addHistory = (entry: Omit<CallbackHistory[number], "at">) =>
+  sql`${callbacks.history} || ${JSON.stringify([{ at: new Date().toISOString(), ...entry }])}::jsonb`;
+
+const pendingFor = async (tx: Tx, contactId: string) =>
+  (await tx.select().from(callbacks).where(and(eq(callbacks.contactId, contactId), eq(callbacks.status, "pending"))).limit(1))[0];
 
 /** Creates the pending callback, or moves the existing one. Returns what's needed to undo it. */
 export async function scheduleCallback(
-  contact: { _id: Id; campaignId: Id; assignedTo?: Id | null },
-  by: Id,
+  contact: { id: string; campaignId: string; assignedTo: string | null },
+  by: string,
   dueAt: Date,
   note = "",
+  tx: Tx = db,
 ): Promise<CallbackUndo> {
-  const pending = await Callback.findOne({ contactId: contact._id, status: "pending" }).lean();
+  const pending = await pendingFor(tx, contact.id);
   let undo: CallbackUndo;
   if (pending) {
-    await Callback.updateOne(
-      { _id: pending._id },
-      { dueAt, ...(note ? { note } : {}), $push: { history: { by, action: "rescheduled", dueAt } } },
-    );
+    await tx
+      .update(callbacks)
+      .set({ dueAt, ...(note ? { note } : {}), history: addHistory({ by, action: "rescheduled", dueAt: dueAt.toISOString() }) })
+      .where(eq(callbacks.id, pending.id));
     undo = { before: pending };
   } else {
-    const created = await Callback.create({
-      campaignId: contact.campaignId,
-      contactId: contact._id,
-      callerId: contact.assignedTo ?? null,
-      dueAt,
-      note,
-      history: [{ by, action: "created", dueAt }],
-    });
-    undo = { createdId: String(created._id) };
+    const [created] = await tx
+      .insert(callbacks)
+      .values({
+        campaignId: contact.campaignId,
+        contactId: contact.id,
+        callerId: contact.assignedTo,
+        dueAt,
+        note,
+        history: [{ at: new Date().toISOString(), by, action: "created", dueAt: dueAt.toISOString() }],
+      })
+      .returning({ id: callbacks.id });
+    undo = { createdId: created.id };
   }
-  await Contact.updateOne({ _id: contact._id }, { nextCallbackAt: dueAt });
+  await tx.update(contacts).set({ nextCallbackAt: dueAt }).where(eq(contacts.id, contact.id));
   return undo;
 }
 
 /** Marks the pending callback done or cancelled (if there is one). */
-export async function closeCallback(contactId: Id, by: Id, status: "done" | "cancelled", reason?: string): Promise<CallbackUndo> {
-  const pending = await Callback.findOne({ contactId, status: "pending" }).lean();
+export async function closeCallback(contactId: string, by: string, status: "done" | "cancelled", reason?: string, tx: Tx = db): Promise<CallbackUndo> {
+  const pending = await pendingFor(tx, contactId);
   if (!pending) return {};
-  await Callback.updateOne({ _id: pending._id }, { status, $push: { history: { by, action: status, reason } } });
-  await Contact.updateOne({ _id: contactId }, { nextCallbackAt: null });
+  await tx.update(callbacks).set({ status, history: addHistory({ by, action: status, reason }) }).where(eq(callbacks.id, pending.id));
+  await tx.update(contacts).set({ nextCallbackAt: null }).where(eq(contacts.id, contactId));
   return { before: pending };
 }
 
-export async function undoCallbackChange(undo: CallbackUndo | undefined) {
-  if (undo?.createdId) await Callback.deleteOne({ _id: undo.createdId });
-  if (undo?.before) await Callback.replaceOne({ _id: undo.before._id }, undo.before);
+/** Reverses scheduleCallback/closeCallback using what they returned (stored as JSON, so dates arrive as strings). */
+export async function undoCallbackChange(undo: CallbackUndo | undefined, tx: Tx = db) {
+  if (undo?.createdId) await tx.delete(callbacks).where(eq(callbacks.id, undo.createdId));
+  const b = undo?.before;
+  if (b)
+    await tx
+      .update(callbacks)
+      .set({
+        dueAt: new Date(b.dueAt),
+        note: b.note,
+        status: b.status,
+        callerId: b.callerId,
+        history: b.history,
+        updatedAt: new Date(b.updatedAt),
+      })
+      .where(eq(callbacks.id, b.id));
 }

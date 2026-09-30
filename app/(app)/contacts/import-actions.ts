@@ -1,20 +1,16 @@
 "use server";
 
-import { Types } from "mongoose";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
+import { audit } from "@/lib/audit";
+import { OPEN_STAGES } from "@/lib/calling";
+import { campaignCallers, campaigns, contacts, db, importBatches, importChunks, users } from "@/lib/db";
 import { assignRows, CHUNK_SIZE, cleanRow, IMPORT_FIELDS, type ImportField, splitTags, STRATEGIES } from "@/lib/import";
-import { audit } from "@/lib/models/audit-event";
-import { Campaign } from "@/lib/models/campaign";
-import { Contact } from "@/lib/models/contact";
-import { ImportBatch } from "@/lib/models/import-batch";
-import { User } from "@/lib/models/user";
-import { objectId } from "@/lib/schemas";
+import { recordId } from "@/lib/schemas";
 import { requireOwner } from "@/lib/session";
 
 type Result<T = object> = ({ ok: true } & T) | { ok: false; error: string };
-const oid = (id: string) => new Types.ObjectId(id);
-const CLOSED_STAGES = ["enrolled", "not_interested", "wrong_number", "do_not_contact"];
 
 const fieldKeys = IMPORT_FIELDS.map((f) => f.key) as [ImportField, ...ImportField[]];
 const cell = z.string().max(5000);
@@ -22,19 +18,25 @@ const cell = z.string().max(5000);
 /** Phones already in this campaign, for the preview. Up to 5000 per call. */
 export async function findExistingPhones(input: unknown): Promise<Result<{ phones: string[] }>> {
   await requireOwner();
-  const p = z.strictObject({ campaignId: objectId, phones: z.array(z.string().regex(/^0\d{9}$/)).max(5000) }).safeParse(input);
+  const p = z.strictObject({ campaignId: recordId, phones: z.array(z.string().regex(/^0\d{9}$/)).max(5000) }).safeParse(input);
   if (!p.success) return { ok: false, error: "Invalid request." };
-  const phones = await Contact.distinct("phone", { campaignId: oid(p.data.campaignId), phone: { $in: p.data.phones } });
+  const rows = p.data.phones.length
+    ? await db
+        .select({ phone: contacts.phone })
+        .from(contacts)
+        .where(and(eq(contacts.campaignId, p.data.campaignId), inArray(contacts.phone, p.data.phones)))
+    : [];
+  const phones = rows.map((r) => r.phone);
   return { ok: true, phones };
 }
 
 const startSchema = z.strictObject({
   key: z.uuid(),
-  campaignId: objectId,
+  campaignId: recordId,
   fileName: z.string().max(200),
   mapping: z.partialRecord(z.enum(fieldKeys), z.string().max(200)),
   strategy: z.enum(STRATEGIES),
-  oneCallerId: objectId.optional(),
+  oneCallerId: recordId.optional(),
   defaultTags: z.string().max(500),
   defaultSource: z.string().trim().max(80),
   totalRows: z.number().int().min(0).max(100_000),
@@ -48,30 +50,38 @@ export async function startImport(input: unknown): Promise<Result<{ doneChunks: 
   if (!p.success) return { ok: false, error: "Invalid import settings." };
   const d = p.data;
 
-  const campaign = await Campaign.findById(d.campaignId, { callers: 1 }).lean();
+  const [campaign] = await db.select({ id: campaigns.id }).from(campaigns).where(eq(campaigns.id, d.campaignId));
   if (!campaign) return { ok: false, error: "Campaign not found." };
-  if (d.strategy === "one" && !campaign.callers.some((c) => String(c.userId) === d.oneCallerId))
-    return { ok: false, error: "Pick a caller who is on this campaign." };
-
-  const existing = await ImportBatch.findOne({ key: d.key }, { campaignId: 1, chunks: 1 }).lean();
-  if (existing) {
-    if (String(existing.campaignId) !== d.campaignId) return { ok: false, error: "Import key belongs to another campaign." };
-    return { ok: true, doneChunks: existing.chunks.map((c) => c.index) };
+  if (d.strategy === "one") {
+    const [member] = d.oneCallerId
+      ? await db
+          .select({ id: campaignCallers.userId })
+          .from(campaignCallers)
+          .where(and(eq(campaignCallers.campaignId, d.campaignId), eq(campaignCallers.userId, d.oneCallerId)))
+      : [];
+    if (!member) return { ok: false, error: "Pick a caller who is on this campaign." };
   }
 
-  try {
-    const batch = await ImportBatch.create({ ...d, defaultTags: splitTags(d.defaultTags), createdBy: me.id });
+  // A repeated start with the same key returns the batch; the unique key makes parallel starts safe.
+  const [created] = await db
+    .insert(importBatches)
+    .values({ ...d, defaultTags: splitTags(d.defaultTags), createdBy: me.id })
+    .onConflictDoNothing({ target: importBatches.key })
+    .returning({ id: importBatches.id });
+  if (created) {
     await audit({
       actorId: me.id,
       action: "import.start",
       entity: "importBatches",
-      entityId: batch._id,
+      entityId: created.id,
       after: { campaignId: d.campaignId, fileName: d.fileName, totalRows: d.totalRows, strategy: d.strategy },
     });
-  } catch (e) {
-    if ((e as { code?: number }).code !== 11000) throw e; // a parallel retry created it first
+    return { ok: true, doneChunks: [] };
   }
-  return { ok: true, doneChunks: [] };
+  const [existing] = await db.select().from(importBatches).where(eq(importBatches.key, d.key));
+  if (existing.campaignId !== d.campaignId) return { ok: false, error: "Import key belongs to another campaign." };
+  const done = await db.select({ index: importChunks.index }).from(importChunks).where(eq(importChunks.batchId, existing.id));
+  return { ok: true, doneChunks: done.map((c) => c.index).sort((a, b) => a - b) };
 }
 
 const chunkSchema = z.strictObject({
@@ -95,9 +105,11 @@ export async function importChunk(input: unknown): Promise<Result<ChunkResult>> 
   if (!p.success) return { ok: false, error: "Invalid chunk." };
   const { key, index, rows } = p.data;
 
-  const batch = await ImportBatch.findOne({ key });
+  const [batch] = await db.select().from(importBatches).where(eq(importBatches.key, key));
   if (!batch) return { ok: false, error: "Import not found — start again." };
-  const done = batch.chunks.find((c) => c.index === index);
+  const recorded = async () =>
+    (await db.select().from(importChunks).where(and(eq(importChunks.batchId, batch.id), eq(importChunks.index, index))))[0];
+  const done = await recorded();
   if (done) return { ok: true, created: done.created, skipped: done.skipped, invalid: done.invalid };
 
   // Never trust the browser's preview: validate every row again.
@@ -113,79 +125,111 @@ export async function importChunk(input: unknown): Promise<Result<ChunkResult>> 
     }
   }
 
-  const campaign = await Campaign.findById(batch.campaignId, { callers: 1 }).lean();
-  if (!campaign) return { ok: false, error: "Campaign not found." };
-  const activeCallers = await User.find({ _id: { $in: campaign.callers.map((c) => c.userId) }, active: true }, { _id: 1 }).lean();
-  const callers = campaign.callers.map((c) => String(c.userId)).filter((id) => activeCallers.some((u) => String(u._id) === id));
+  const callers = (
+    await db
+      .select({ id: campaignCallers.userId })
+      .from(campaignCallers)
+      .innerJoin(users, eq(users.id, campaignCallers.userId))
+      .where(and(eq(campaignCallers.campaignId, batch.campaignId), eq(users.active, true)))
+      .orderBy(asc(campaignCallers.position))
+  ).map((c) => c.id);
 
-  const already = new Set(await Contact.distinct("phone", { campaignId: batch.campaignId, phone: { $in: clean.map((c) => c.phone) } }));
+  const phones = clean.map((c) => c.phone);
+  const already = new Set(
+    phones.length
+      ? (
+          await db
+            .select({ phone: contacts.phone })
+            .from(contacts)
+            .where(and(eq(contacts.campaignId, batch.campaignId), inArray(contacts.phone, phones)))
+        ).map((r) => r.phone)
+      : [],
+  );
   const fresh = clean.filter((c) => !already.has(c.phone));
 
   let openCounts: Record<string, number> = {};
-  if (batch.strategy === "balanced") {
-    const agg = await Contact.aggregate<{ _id: Types.ObjectId; n: number }>([
-      { $match: { campaignId: batch.campaignId, assignedTo: { $in: callers.map(oid) }, stage: { $nin: CLOSED_STAGES } } },
-      { $group: { _id: "$assignedTo", n: { $sum: 1 } } },
-    ]);
-    openCounts = Object.fromEntries(agg.map((a) => [String(a._id), a.n]));
+  if (batch.strategy === "balanced" && callers.length) {
+    const rows = await db
+      .select({ id: contacts.assignedTo, n: sql<number>`count(*)::int` })
+      .from(contacts)
+      .where(and(eq(contacts.campaignId, batch.campaignId), inArray(contacts.assignedTo, callers), inArray(contacts.stage, OPEN_STAGES)))
+      .groupBy(contacts.assignedTo);
+    openCounts = Object.fromEntries(rows.map((r) => [r.id!, r.n]));
   }
   const assignees = assignRows(
     fresh.map((c) => c.row),
     batch.strategy,
     callers,
-    { openCounts, one: batch.oneCallerId ? String(batch.oneCallerId) : undefined },
+    { openCounts, one: batch.oneCallerId ?? undefined },
   );
 
-  if (fresh.length) {
-    await Contact.insertMany(
-      fresh.map(({ row: _row, ...c }, i) => ({ // eslint-disable-line @typescript-eslint/no-unused-vars
-        ...c,
-        campaignId: batch.campaignId,
-        source: c.source || batch.defaultSource,
-        tags: [...new Set([...c.tags, ...batch.defaultTags])],
-        assignedTo: assignees[i] ? oid(assignees[i]!) : null,
-        importBatchId: batch._id,
-      })),
-      { ordered: false },
-    ).catch((e) => {
-      if (!e?.writeErrors?.every((w: { code?: number; err?: { code?: number } }) => (w.code ?? w.err?.code) === 11000)) throw e;
-    });
-  }
+  if (fresh.length)
+    await db
+      .insert(contacts)
+      .values(
+        fresh.map(({ row: _row, ...c }, i) => ({ // eslint-disable-line @typescript-eslint/no-unused-vars
+          ...c,
+          altPhone: c.altPhone ?? null,
+          campaignId: batch.campaignId,
+          source: c.source || batch.defaultSource,
+          tags: [...new Set([...c.tags, ...batch.defaultTags])],
+          assignedTo: assignees[i],
+          importBatchId: batch.id,
+        })),
+      )
+      .onConflictDoNothing({ target: [contacts.campaignId, contacts.phone] }); // added meanwhile by someone else → skipped
 
   // Whatever now exists from *this* batch counts as created (covers a retried, half-finished attempt).
   const mine = new Set(
-    await Contact.distinct("phone", { importBatchId: batch._id, phone: { $in: clean.map((c) => c.phone) } }),
+    phones.length
+      ? (
+          await db
+            .select({ phone: contacts.phone })
+            .from(contacts)
+            .where(and(eq(contacts.importBatchId, batch.id), inArray(contacts.phone, phones)))
+        ).map((r) => r.phone)
+      : [],
   );
   const result: ChunkResult = {
     created: clean.filter((c) => mine.has(c.phone)).map((c) => c.row),
     skipped: clean.filter((c) => !mine.has(c.phone)).map((c) => c.row),
     invalid,
   };
-  await ImportBatch.updateOne({ _id: batch._id, "chunks.index": { $ne: index } }, { $push: { chunks: { index, ...result } } });
-  return { ok: true, ...result };
+  // The (batch, index) primary key records each chunk once, even if two retries race.
+  await db.insert(importChunks).values({ batchId: batch.id, index, ...result }).onConflictDoNothing();
+  const saved = (await recorded())!;
+  return { ok: true, created: saved.created, skipped: saved.skipped, invalid: saved.invalid };
 }
 
 export async function finishImport(input: unknown): Promise<Result<{ created: number; skipped: number; invalid: number }>> {
   const me = await requireOwner();
   const key = z.uuid().safeParse(input);
   if (!key.success) return { ok: false, error: "Invalid request." };
-  const batch = await ImportBatch.findOne({ key: key.data });
+  const [batch] = await db.select().from(importBatches).where(eq(importBatches.key, key.data));
   if (!batch) return { ok: false, error: "Import not found." };
 
-  const sum = (k: "created" | "skipped" | "invalid") => batch.chunks.reduce((n, c) => n + c[k].length, 0);
-  const counts = { created: sum("created"), skipped: sum("skipped"), invalid: sum("invalid") };
-  if (batch.status !== "done") {
-    batch.status = "done";
-    batch.finishedAt = new Date();
-    await batch.save();
+  const [counts] = await db
+    .select({
+      created: sql<number>`coalesce(sum(cardinality(${importChunks.created})), 0)::int`,
+      skipped: sql<number>`coalesce(sum(cardinality(${importChunks.skipped})), 0)::int`,
+      invalid: sql<number>`coalesce(sum(cardinality(${importChunks.invalid})), 0)::int`,
+    })
+    .from(importChunks)
+    .where(eq(importChunks.batchId, batch.id));
+  // Only the first finish flips the status, so it's audited once.
+  const finished = await db
+    .update(importBatches)
+    .set({ status: "done", finishedAt: new Date() })
+    .where(and(eq(importBatches.id, batch.id), eq(importBatches.status, "running")))
+    .returning({ id: importBatches.id });
+  if (finished.length)
     await audit({
       actorId: me.id,
       action: "import.finish",
       entity: "importBatches",
-      entityId: batch._id,
+      entityId: batch.id,
       after: { ...counts, rejectedInBrowser: batch.rejectedInBrowser },
     });
-  }
   revalidatePath("/contacts");
   revalidatePath("/campaigns");
   return { ok: true, ...counts };

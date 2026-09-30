@@ -1,14 +1,12 @@
 // Picks who a caller should phone next, and shapes a contact for the calling screen.
-import { Types } from "mongoose";
+import { and, asc, desc, eq, gte, inArray, isNull, lt, notInArray, type SQL } from "drizzle-orm";
 import { OPEN_STAGES } from "./calling";
-import { Call } from "./models/call";
-import { Callback } from "./models/callback";
-import { Contact, type ContactDoc } from "./models/contact";
-import { User } from "./models/user";
+import { callbacks, calls, contacts, db, users } from "./db";
 import { dayBounds } from "./time";
 import type { Outcome, Stage } from "./vocab";
 
 export type NextReason = "overdue_callback" | "callback_today" | "never_called" | "follow_up" | "chosen";
+type Contact = typeof contacts.$inferSelect;
 
 /**
  * Priority: overdue callbacks → today's callbacks → never called → longest since last attempt.
@@ -16,19 +14,16 @@ export type NextReason = "overdue_callback" | "callback_today" | "never_called" 
  */
 export async function findNextContact(callerId: string, campaignId: string, skip: string[] = [], now = new Date()) {
   const { end } = dayBounds(now);
-  const base = {
-    campaignId: new Types.ObjectId(campaignId),
-    assignedTo: new Types.ObjectId(callerId),
-    _id: { $nin: skip.map((id) => new Types.ObjectId(id)) },
-  };
-  const steps: [NextReason, object, Record<string, 1>][] = [
-    ["overdue_callback", { nextCallbackAt: { $lt: now } }, { nextCallbackAt: 1 }],
-    ["callback_today", { nextCallbackAt: { $gte: now, $lt: end } }, { nextCallbackAt: 1 }],
-    ["never_called", { nextCallbackAt: null, lastCallAt: null, stage: { $in: OPEN_STAGES } }, { createdAt: 1 }],
-    ["follow_up", { nextCallbackAt: null, stage: { $in: OPEN_STAGES } }, { lastCallAt: 1 }],
+  const base = and(eq(contacts.campaignId, campaignId), eq(contacts.assignedTo, callerId), skip.length ? notInArray(contacts.id, skip) : undefined);
+  const open = inArray(contacts.stage, OPEN_STAGES);
+  const steps: [NextReason, SQL | undefined, SQL][] = [
+    ["overdue_callback", lt(contacts.nextCallbackAt, now), asc(contacts.nextCallbackAt)],
+    ["callback_today", and(gte(contacts.nextCallbackAt, now), lt(contacts.nextCallbackAt, end)), asc(contacts.nextCallbackAt)],
+    ["never_called", and(isNull(contacts.nextCallbackAt), isNull(contacts.lastCallAt), open), asc(contacts.createdAt)],
+    ["follow_up", and(isNull(contacts.nextCallbackAt), open), asc(contacts.lastCallAt)],
   ];
-  for (const [reason, filter, sort] of steps) {
-    const contact = await Contact.findOne({ ...base, ...filter }).sort({ ...sort, _id: 1 }).lean();
+  for (const [reason, filter, order] of steps) {
+    const [contact] = await db.select().from(contacts).where(and(base, filter)).orderBy(order, asc(contacts.id)).limit(1);
     if (contact) return { contact, reason };
   }
   return null;
@@ -52,28 +47,36 @@ export type ContactCard = {
   recentCalls: { outcome: Outcome; calledAt: string; notes: string; caller: string }[];
 };
 
-export async function toCard(contact: ContactDoc & { _id: Types.ObjectId }, reason: NextReason): Promise<ContactCard> {
-  const [calls, callback] = await Promise.all([
-    Call.find({ contactId: contact._id }).sort({ calledAt: -1 }).limit(3).lean(),
-    Callback.findOne({ contactId: contact._id, status: "pending" }, { note: 1 }).lean(),
+export async function toCard(contact: Contact, reason: NextReason): Promise<ContactCard> {
+  const [recent, [callback]] = await Promise.all([
+    db
+      .select({ outcome: calls.outcome, calledAt: calls.calledAt, notes: calls.notes, caller: users.name })
+      .from(calls)
+      .leftJoin(users, eq(users.id, calls.callerId))
+      .where(eq(calls.contactId, contact.id))
+      .orderBy(desc(calls.calledAt))
+      .limit(3),
+    db
+      .select({ note: callbacks.note })
+      .from(callbacks)
+      .where(and(eq(callbacks.contactId, contact.id), eq(callbacks.status, "pending")))
+      .limit(1),
   ]);
-  const callers = await User.find({ _id: { $in: calls.map((c) => c.callerId) } }, { name: 1 }).lean();
-  const name = (id: unknown) => callers.find((u) => String(u._id) === String(id))?.name ?? "";
   return {
-    id: String(contact._id),
+    id: contact.id,
     name: contact.name,
     phone: contact.phone,
     altPhone: contact.altPhone ?? "",
-    school: contact.school ?? "",
-    district: contact.district ?? "",
-    gradeOrBatch: contact.gradeOrBatch ?? "",
+    school: contact.school,
+    district: contact.district,
+    gradeOrBatch: contact.gradeOrBatch,
     notes: contact.notes,
     stage: contact.stage,
-    lastOutcome: contact.lastOutcome ?? null,
+    lastOutcome: contact.lastOutcome,
     lastCallAt: contact.lastCallAt?.toISOString() ?? null,
     nextCallbackAt: contact.nextCallbackAt?.toISOString() ?? null,
     callbackNote: callback?.note ?? "",
     reason,
-    recentCalls: calls.map((c) => ({ outcome: c.outcome, calledAt: c.calledAt.toISOString(), notes: c.notes, caller: name(c.callerId) })),
+    recentCalls: recent.map((c) => ({ outcome: c.outcome, calledAt: c.calledAt.toISOString(), notes: c.notes, caller: c.caller ?? "" })),
   };
 }

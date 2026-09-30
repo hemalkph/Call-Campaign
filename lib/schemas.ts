@@ -6,7 +6,7 @@ import { CAMPAIGN_STATUSES, OUTCOMES, STAGES } from "./vocab";
 export const ROLES = ["owner", "caller"] as const;
 export type Role = (typeof ROLES)[number];
 
-export const objectId = z.string().regex(/^[a-f\d]{24}$/i, "Invalid id");
+export const recordId = z.uuid("Invalid id");
 
 const email = z.string().trim().toLowerCase().pipe(z.email("Enter a valid email"));
 
@@ -37,17 +37,17 @@ export const createUserSchema = z.strictObject({
   role: z.enum(ROLES),
 });
 
-export const userIdSchema = z.strictObject({ userId: objectId });
+export const userIdSchema = z.strictObject({ userId: recordId });
 
 /** Owner sets (or generates) a new password for someone else. */
 export const resetPasswordSchema = z
   .strictObject({
-    userId: objectId,
+    userId: recordId,
     password: z.string().min(10, "Use at least 10 characters").max(200),
     confirm: z.string(),
   })
   .refine((v) => v.password === v.confirm, { path: ["confirm"], message: "Passwords don't match" });
-export const setActiveSchema = z.strictObject({ userId: objectId, active: z.boolean() });
+export const setActiveSchema = z.strictObject({ userId: recordId, active: z.boolean() });
 
 export const newPasswordSchema = z
   .strictObject({
@@ -67,7 +67,7 @@ const optionalCount = z.preprocess((v) => (v === "" || v === null || Number.isNa
 
 export const campaignSchema = z
   .strictObject({
-    id: objectId.optional(),
+    id: recordId.optional(),
     name: z.string().trim().min(2, "Enter a name").max(120),
     classLabel: z.string().trim().min(1, "Enter the class / intake").max(120),
     startDate: day,
@@ -78,7 +78,7 @@ export const campaignSchema = z
     script: z.string().max(20_000),
     fee: z.string().trim().max(100),
     link: z.union([z.literal(""), z.url("Enter a full link starting with https://").max(500)]),
-    callers: z.array(z.strictObject({ userId: objectId, dailyCallTarget: optionalCount })).max(100),
+    callers: z.array(z.strictObject({ userId: recordId, dailyCallTarget: optionalCount })).max(100),
   })
   .refine((c) => c.endDate >= c.startDate, { path: ["endDate"], message: "Ends before it starts" });
 
@@ -99,16 +99,16 @@ export const contactFields = z.strictObject({
     .union([text(500), z.array(text(40))])
     .transform((v) => [...new Set((typeof v === "string" ? v.split(",") : v).map((t) => t.trim()).filter(Boolean))].slice(0, 20)),
   notes: text(5000),
-  assignedTo: z.union([objectId, z.literal("")]).optional(), // owner only; "" = unassigned
+  assignedTo: z.union([recordId, z.literal("")]).optional(), // owner only; "" = unassigned
   stage: z.enum(STAGES).optional(),
 });
 
-export const createContactSchema = contactFields.extend({ campaignId: objectId });
-export const updateContactSchema = contactFields.extend({ id: objectId });
+export const createContactSchema = contactFields.extend({ campaignId: recordId });
+export const updateContactSchema = contactFields.extend({ id: recordId });
 
-const ids = z.array(objectId).min(1, "Select contacts").max(500);
+const ids = z.array(recordId).min(1, "Select contacts").max(500);
 export const bulkContactsSchema = z.discriminatedUnion("action", [
-  z.strictObject({ action: z.literal("reassign"), ids, assignedTo: z.union([objectId, z.literal("")]) }),
+  z.strictObject({ action: z.literal("reassign"), ids, assignedTo: z.union([recordId, z.literal("")]) }),
   z.strictObject({ action: z.literal("stage"), ids, stage: z.enum(STAGES) }),
   z.strictObject({ action: z.literal("addTag"), ids, tag: z.string().trim().min(1).max(40) }),
 ]);
@@ -116,7 +116,7 @@ export const bulkContactsSchema = z.discriminatedUnion("action", [
 // ---- Calling ----
 
 export const logCallSchema = z.strictObject({
-  contactId: objectId,
+  contactId: recordId,
   outcome: z.enum(OUTCOMES),
   notes: z.string().trim().max(2000),
   durationSec: z.number().int().min(0).max(4 * 3600).optional(),
@@ -124,18 +124,18 @@ export const logCallSchema = z.strictObject({
   callbackNote: z.string().trim().max(500).optional(),
 });
 
-export const rescheduleSchema = z.strictObject({ id: objectId, dueAt: z.iso.datetime(), note: z.string().trim().max(500).optional() });
-export const cancelCallbackSchema = z.strictObject({ id: objectId, reason: z.string().trim().min(1, "Give a reason").max(300) });
+export const rescheduleSchema = z.strictObject({ id: recordId, dueAt: z.iso.datetime(), note: z.string().trim().max(500).optional() });
+export const cancelCallbackSchema = z.strictObject({ id: recordId, reason: z.string().trim().min(1, "Give a reason").max(300) });
 
 export const templateSchema = z.strictObject({
-  id: objectId.optional(),
+  id: recordId.optional(),
   name: z.string().trim().min(1, "Enter a name").max(80),
   language: z.enum(["si", "en"]),
   body: z.string().trim().min(1, "Write the message").max(2000),
 });
 
 export const whatsappSentSchema = z.strictObject({
-  contactId: objectId,
-  templateId: objectId.optional(),
+  contactId: recordId,
+  templateId: recordId.optional(),
   sent: z.boolean(),
 });

@@ -1,27 +1,24 @@
-import { model, models, type Model, Schema } from "mongoose";
+import { eq, lt, sql } from "drizzle-orm";
+import { db, loginAttempts } from "./db";
 
-// Fixed-window counters; the TTL index removes expired windows.
-const loginAttemptSchema = new Schema({
-  key: { type: String, required: true, index: true },
-  count: { type: Number, default: 0 },
-  expiresAt: { type: Date, required: true, expires: 0 },
-});
-
-const LoginAttempt =
-  (models.LoginAttempt as Model<{ key: string; count: number; expiresAt: Date }>) ??
-  model("LoginAttempt", loginAttemptSchema, "loginAttempts");
-
-/** Counts one hit against `key`; returns false once more than `limit` hits land in the window. */
+/** Counts one hit against `key` (fixed window); returns false once more than `limit` hits land in the window. */
 export async function hit(key: string, limit: number, windowMs: number) {
-  const now = new Date();
-  const doc = await LoginAttempt.findOneAndUpdate(
-    { key, expiresAt: { $gt: now } },
-    { $inc: { count: 1 }, $setOnInsert: { expiresAt: new Date(now.getTime() + windowMs) } },
-    { upsert: true, returnDocument: "after" },
-  );
-  return doc.count <= limit;
+  const expires = sql`now() + ${windowMs} * interval '1 millisecond'`;
+  const [row] = await db
+    .insert(loginAttempts)
+    .values({ key, count: 1, expiresAt: expires })
+    .onConflictDoUpdate({
+      target: loginAttempts.key,
+      set: {
+        count: sql`case when ${loginAttempts.expiresAt} > now() then ${loginAttempts.count} + 1 else 1 end`,
+        expiresAt: sql`case when ${loginAttempts.expiresAt} > now() then ${loginAttempts.expiresAt} else excluded.expires_at end`,
+      },
+    })
+    .returning({ count: loginAttempts.count });
+  if (Math.random() < 0.02) await db.delete(loginAttempts).where(lt(loginAttempts.expiresAt, sql`now() - interval '1 day'`)); // tidy up
+  return row.count <= limit;
 }
 
 export function clear(key: string) {
-  return LoginAttempt.deleteMany({ key });
+  return db.delete(loginAttempts).where(eq(loginAttempts.key, key));
 }

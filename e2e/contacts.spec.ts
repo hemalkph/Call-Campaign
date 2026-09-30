@@ -49,7 +49,7 @@ test("owner creates a campaign, adds a contact and marks them enrolled", async (
   await expect(row).toContainText("Enrolled");
 });
 
-test("owner filters, sorts, pages and bulk-tags contacts", async ({ page }) => {
+test("owner filters, sorts, pages and bulk-tags contacts", async ({ page }, info) => {
   await signIn(page, "owner@example.test");
   await page.goto("/contacts");
   await expect(page.getByText("1–50 of 60").filter({ visible: true })).toBeVisible();
@@ -69,7 +69,7 @@ test("owner filters, sorts, pages and bulk-tags contacts", async ({ page }) => {
   await page.getByLabel("Search name, school or phone").filter({ visible: true }).fill("0710000009");
   await expect(page.getByText("1–1 of 1").filter({ visible: true })).toBeVisible();
   await page.getByLabel("Select all on this page").check();
-  await page.getByLabel("Tag to add").fill("follow-up");
+  await page.getByLabel("Tag to add").fill(`follow-up-${info.project.name}`); // each browser project tags the same contact
   await page.getByRole("button", { name: "Add tag" }).click();
   await expect(page.getByText("Updated 1 contact")).toBeVisible();
 });

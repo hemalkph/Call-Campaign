@@ -1,6 +1,6 @@
 # Backups and exports
 
-The free MongoDB Atlas M0 cluster **does not take backups**, so use both of the routines below.
+Don't rely on the Supabase free plan for backups. Use both routines below.
 
 ## Weekly: Excel exports (5 minutes, no tools)
 
@@ -12,28 +12,31 @@ As the owner, for each active campaign: **Contacts → Export**, then download e
 4. Callbacks
 5. Per-caller performance
 
-Clear any filters first so the exports include everything. Save the files in a dated folder (e.g. `Backups/2026-10-05/`) somewhere safe, such as a private Google Drive folder.
+Clear any filters first so the exports include everything. Save the files in a dated folder (e.g. `Backups/2026-10-05/`) somewhere private.
 
 These files are for people to read and keep as a record. Contacts can be re-imported from the contacts file, but call history and logs can't be restored from Excel.
 
-## Weekly or monthly: full database copy (`mongodump`)
+## Weekly or monthly: full database copy (`pg_dump`)
 
 This is the real backup, and it can be restored completely.
 
-1. Install the [MongoDB Database Tools](https://www.mongodb.com/try/download/database-tools) (on a Mac: `brew install mongodb-database-tools`).
-2. Make the backup:
+1. Install the PostgreSQL client tools, version 17 to match Supabase (on a Mac: `brew install postgresql@17`).
+2. In Supabase, open **Connect** and copy the **Session pooler** connection string (port 5432). It works on IPv4 networks, unlike the direct connection.
+3. Make the backup:
    ```bash
-   mongodump --uri="mongodb+srv://…/call-campaign?…" --gzip --archive="call-campaign-$(date +%F).gz"
+   pg_dump "postgresql://postgres.<ref>:<password>@<host>:5432/postgres" \
+     --schema=public --no-owner --format=custom --file="call-campaign-$(date +%F).dump"
    ```
-3. Keep the `.gz` file somewhere private. **It contains students' phone numbers.**
-4. To restore (e.g. into a new cluster), run:
+4. Keep the `.dump` file somewhere private. **It contains students' phone numbers.**
+5. To restore (e.g. into a new Supabase project), apply the schema first with `npm run db:migrate`, then load the data:
    ```bash
-   mongorestore --uri="mongodb+srv://…/call-campaign?…" --gzip --archive=call-campaign-2026-10-05.gz --drop
+   pg_restore --data-only --no-owner --disable-triggers \
+     --dbname="postgresql://postgres.<ref>:<password>@<host>:5432/postgres" call-campaign-2026-10-05.dump
    ```
-   `--drop` replaces what's there. Test a restore into a separate `call-campaign-test` database once, so you know it works.
+   Test a restore once into a spare project, so you know it works before you need it.
 
 ## Retention
 
 When an intake ends, set the campaign to **Ended** and take a final export and dump.
 
-If a student or parent asks for their number to be removed, find the contact and set their stage to **Do not contact**, or delete them from the database.
+If a student or parent asks for their number to be removed, find the contact and set their stage to **Do not contact**, or delete the contact in Supabase's table editor.

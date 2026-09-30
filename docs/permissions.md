@@ -33,6 +33,10 @@ Contact queries all go through `contactFilter()` in `lib/contacts-query.ts`, whi
 ## Sessions and sign-in
 
 - **Session cookie:** httpOnly, SameSite=Lax, and secure on HTTPS. It expires after 12 hours.
-- **Rate limit:** 5 attempts per email and 30 per IP address every 15 minutes (stored in MongoDB).
+- **Rate limit:** 5 attempts per email and 30 per IP address every 15 minutes (stored in PostgreSQL).
 - **Temporary passwords** are shown once. The user must replace one at first sign-in.
 - **Deactivating a user** or **resetting their password** signs them out on every device immediately.
+
+## Database access
+
+The app connects to PostgreSQL from the server only. Every table has row-level security switched on with no policies, and the `anon` / `authenticated` roles have no grants, so Supabase's public Data API can't read or change anything. All access rules live in the server code above.

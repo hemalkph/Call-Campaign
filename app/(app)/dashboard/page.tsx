@@ -7,7 +7,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { visibleCampaigns } from "@/lib/contacts-query";
-import { Campaign } from "@/lib/models/campaign";
+import { eq } from "drizzle-orm";
+import { campaigns as campaignsTable, db } from "@/lib/db";
 import { callerPerformance, dailyCalls, stageCounts, topSources } from "@/lib/reports";
 import { requireOwner } from "@/lib/session";
 import { STAGE_META, type Stage } from "@/lib/vocab";
@@ -37,8 +38,8 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
 
   const requested = (await searchParams).campaign;
   const campaign = campaigns.find((c) => c.id === requested) ?? campaigns[0];
-  const [details, callers, stages, sources, daily] = await Promise.all([
-    Campaign.findById(campaign.id, { enrollmentTarget: 1 }).lean(),
+  const [[details], callers, stages, sources, daily] = await Promise.all([
+    db.select({ enrollmentTarget: campaignsTable.enrollmentTarget }).from(campaignsTable).where(eq(campaignsTable.id, campaign.id)),
     callerPerformance(campaign.id),
     stageCounts(campaign.id),
     topSources(campaign.id),

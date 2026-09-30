@@ -1,10 +1,8 @@
-import { Types } from "mongoose";
+import { and, count, desc, asc, eq, gte, inArray, lt, type SQL } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import Link from "next/link";
 import { PageHeader } from "@/components/page-header";
-import { Campaign } from "@/lib/models/campaign";
-import { Callback } from "@/lib/models/callback";
-import { Contact } from "@/lib/models/contact";
-import { User } from "@/lib/models/user";
+import { callbacks, campaigns, contacts, db, users } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { dayBounds } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -15,6 +13,7 @@ export const metadata = { title: "Callbacks" };
 const TABS = ["overdue", "today", "upcoming", "done"] as const;
 type Tab = (typeof TABS)[number];
 const TAB_LABEL: Record<Tab, string> = { overdue: "Overdue", today: "Today", upcoming: "Upcoming", done: "Done" };
+const caller = alias(users, "caller");
 
 export default async function CallbacksPage({ searchParams }: { searchParams: Promise<{ tab?: string }> }) {
   const me = await requireUser();
@@ -22,27 +21,31 @@ export default async function CallbacksPage({ searchParams }: { searchParams: Pr
   const tab: Tab = TABS.find((t) => t === requested) ?? "overdue";
   const now = new Date();
   const { end } = dayBounds(now);
-  const scope = me.role === "owner" ? {} : { callerId: new Types.ObjectId(me.id) };
-  const filters: Record<Tab, object> = {
-    overdue: { status: "pending", dueAt: { $lt: now } },
-    today: { status: "pending", dueAt: { $gte: now, $lt: end } },
-    upcoming: { status: "pending", dueAt: { $gte: end } },
-    done: { status: { $in: ["done", "cancelled"] } },
+  const scope = me.role === "owner" ? undefined : eq(callbacks.callerId, me.id);
+  const pending = eq(callbacks.status, "pending");
+  const filters: Record<Tab, SQL | undefined> = {
+    overdue: and(pending, lt(callbacks.dueAt, now)),
+    today: and(pending, gte(callbacks.dueAt, now), lt(callbacks.dueAt, end)),
+    upcoming: and(pending, gte(callbacks.dueAt, end)),
+    done: inArray(callbacks.status, ["done", "cancelled"]),
   };
 
   const [counts, items] = await Promise.all([
-    Promise.all(TABS.map((t) => (t === "done" ? Promise.resolve(null) : Callback.countDocuments({ ...scope, ...filters[t] })))),
-    Callback.find({ ...scope, ...filters[tab] })
-      .sort(tab === "done" ? { updatedAt: -1 } : { dueAt: 1 })
-      .limit(100)
-      .lean(),
+    Promise.all(
+      TABS.map(async (t) =>
+        t === "done" ? null : (await db.select({ n: count() }).from(callbacks).where(and(scope, filters[t])))[0].n,
+      ),
+    ),
+    db
+      .select({ cb: callbacks, contactName: contacts.name, phone: contacts.phone, campaignName: campaigns.name, callerName: caller.name })
+      .from(callbacks)
+      .innerJoin(contacts, eq(contacts.id, callbacks.contactId))
+      .innerJoin(campaigns, eq(campaigns.id, callbacks.campaignId))
+      .leftJoin(caller, eq(caller.id, callbacks.callerId))
+      .where(and(scope, filters[tab]))
+      .orderBy(tab === "done" ? desc(callbacks.updatedAt) : asc(callbacks.dueAt))
+      .limit(100),
   ]);
-  const [contacts, campaigns, users] = await Promise.all([
-    Contact.find({ _id: { $in: items.map((i) => i.contactId) } }, { name: 1, phone: 1 }).lean(),
-    Campaign.find({ _id: { $in: items.map((i) => i.campaignId) } }, { name: 1 }).lean(),
-    me.role === "owner" ? User.find({ _id: { $in: items.map((i) => i.callerId) } }, { name: 1 }).lean() : Promise.resolve([]),
-  ]);
-  const find = <T extends { _id: unknown }>(list: T[], id: unknown) => list.find((x) => String(x._id) === String(id));
 
   return (
     <>
@@ -65,14 +68,14 @@ export default async function CallbacksPage({ searchParams }: { searchParams: Pr
       </nav>
       <CallbackList
         tab={tab}
-        items={items.map((cb) => ({
-          id: String(cb._id),
-          contactId: String(cb.contactId),
-          campaignId: String(cb.campaignId),
-          contactName: find(contacts, cb.contactId)?.name ?? "Deleted contact",
-          phone: find(contacts, cb.contactId)?.phone ?? "",
-          campaignName: find(campaigns, cb.campaignId)?.name ?? "",
-          callerName: me.role === "owner" ? (find(users, cb.callerId)?.name ?? "Unassigned") : undefined,
+        items={items.map(({ cb, contactName, phone, campaignName, callerName }) => ({
+          id: cb.id,
+          contactId: cb.contactId,
+          campaignId: cb.campaignId,
+          contactName,
+          phone,
+          campaignName,
+          callerName: me.role === "owner" ? (callerName ?? "Unassigned") : undefined,
           dueAt: cb.dueAt.toISOString(),
           note: cb.note,
           status: cb.status,

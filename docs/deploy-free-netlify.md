@@ -1,4 +1,4 @@
-# Going live for free: Netlify + MongoDB Atlas
+# Going live for free: Netlify + Supabase
 
 Total cost: **Rs. 0**. No credit card is needed for either service.
 
@@ -40,21 +40,25 @@ git push -u origin main
 
 A private repository is fine.
 
-## 2. MongoDB Atlas (free M0 database)
+## 2. Supabase (free PostgreSQL database)
 
-1. Go to <https://cloud.mongodb.com> and sign up. Create a project, then **Create → M0 Free**.
-   - **Provider AWS, region Ohio (us-east-2)** if it's offered, otherwise **N. Virginia (us-east-1)**.
-   - *Why the USA?* Netlify's free plan runs the app's server code in Ohio, and each page runs several database queries. Keeping the database next to that server code makes pages load fast from Sri Lanka. A database in Mumbai would add a slow round trip to every single query.
-2. **Database Access → Add New Database User.**
-   - Username `callcampaign-app`. Click **Autogenerate Secure Password** and copy it somewhere safe.
-   - Role: **Read and write to any database**.
-3. **Network Access → Add IP Address → Allow access from anywhere (`0.0.0.0/0`).**
-   - Netlify's servers don't have a fixed IP, so this is required. The long random password is what protects the data.
-4. **Database → Connect → Drivers** and copy the connection string. Add the database name `call-campaign` before the `?`:
+1. At <https://supabase.com/dashboard>, create a project.
+   - **Region: East US (Ohio)**. Netlify's free plan runs the app's server code in Ohio, and each page runs several database queries, so keeping the database next to it keeps pages fast from Sri Lanka. A database in Sydney or Mumbai adds a slow round trip to *every* query.
+   - Let Supabase generate the database password and save it in a password manager.
+   - The region can't be changed later. If a project is in the wrong region, make a new one.
+2. Open **Connect** (top of the project page) and copy two connection strings, putting your password in each:
+   - **Transaction pooler** (port **6543**). The app uses this one.
+   - **Session pooler** (port **5432**). Used from your computer for migrations and backups.
+3. Create the tables. On your computer, in the project folder, run this with the **Session pooler** string. Type it in the command; don't save it in `.env.local`:
+   ```bash
+   DATABASE_URL="postgresql://postgres.<ref>:<password>@<host>:5432/postgres" npm run db:migrate
    ```
-   mongodb+srv://callcampaign-app:<password>@<your-cluster>.mongodb.net/call-campaign?retryWrites=true&w=majority
-   ```
-   If the password has any of `@ : / ? # %`, generate a new one without them. That's easier than encoding them.
+   This creates all tables and indexes, turns on row-level security, and blocks Supabase's public Data API from them. The app talks to the database directly from the server.
+4. Optional: **Advisors → Security Advisor** in Supabase will list the tables as "RLS enabled, no policy". That's intentional: nobody reaches them through the Data API.
+
+> **Free-plan notes:**
+> - Supabase pauses free projects after about a week with no activity. Daily use keeps it awake, and you can restore a paused project from the dashboard.
+> - Don't rely on the free plan for backups. Set up [backup.md](backup.md) before real data goes in.
 
 ## 3. Netlify
 
@@ -65,7 +69,7 @@ A private repository is fine.
 
    | Key | Value |
    | --- | --- |
-   | `MONGODB_URI` | the Atlas string from step 2.4 |
+   | `DATABASE_URL` | the **Transaction pooler** string from step 2.2 (port 6543) |
    | `AUTH_SECRET` | a **new** secret. On your computer run `npx auth secret` (or `openssl rand -base64 33`) and paste what it prints. Don't reuse the one in `.env.local`. |
 
 4. Click **Deploy**. After 2–4 minutes you get a web address like `https://call-campaign-xyz.netlify.app`.
@@ -73,10 +77,10 @@ A private repository is fine.
 
 ## 4. Create your owner account
 
-On your computer, in the project folder, run this with the **live** connection string. Type it in the command; **don't** put it in `.env.local`:
+On your computer, in the project folder, run this with the **Session pooler** string. Type it in the command; **don't** put it in `.env.local`:
 
 ```bash
-MONGODB_URI="mongodb+srv://callcampaign-app:…/call-campaign?retryWrites=true&w=majority" npm run create-owner -- "Your Name" you@example.com
+DATABASE_URL="postgresql://postgres.<ref>:<password>@<host>:5432/postgres" npm run create-owner -- "Your Name" you@example.com
 ```
 
 1. It prints a temporary password. Open your Netlify address, sign in with it, and choose your own password.
@@ -85,7 +89,7 @@ MONGODB_URI="mongodb+srv://callcampaign-app:…/call-campaign?retryWrites=true&w
 4. **Contacts → Import CSV.**
 5. **Templates:** add your real WhatsApp messages.
 
-Never run `npm run seed` on the live database. It refuses anyway, because the database name doesn't end in `-dev`.
+Never run `npm run seed` on the live database. It refuses anyway: it only runs against a database on your own computer.
 
 ## 5. Save credits: control when the live site updates
 
@@ -101,11 +105,13 @@ Check usage any time under **Team → Usage / Billing**.
 
 - Sign in on a caller's **phone**. **Start calling → Call** should open the dialler, and **WhatsApp** should open WhatsApp with the message.
 - Import a small test file first, e.g. `docs/sample-contacts.csv`, into a *test* campaign, then delete that campaign's contacts or keep it as a draft.
-- Set up the backup routine in [backup.md](backup.md). **The free Atlas cluster has no automatic backups.**
+- Set up the backup routine in [backup.md](backup.md). **Don't rely on the free plan for backups.**
 
 ## If you outgrow the free plan
 
 Signs you've outgrown it: the site got paused, or Netlify emails say you're at 75% early in the month. That means the class is getting real use. Since the class earns fees, it's reasonable to ask for a paid plan, either Netlify's paid tier or Vercel Pro. **Nothing in the app needs to change**: add the same two environment variables on the new host and point your domain at it.
+
+**Changing the database later:** edit `lib/db/schema.ts`, run `npm run db:generate` to create a migration in `drizzle/`, commit it, and run `npm run db:migrate` against Supabase (Session pooler string) before deploying. Any new table needs RLS switched on like the existing ones; see `drizzle/0001_lock_down.sql`.
 
 ## Other free options (and why they're second choice)
 

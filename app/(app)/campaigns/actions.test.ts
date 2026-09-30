@@ -1,12 +1,12 @@
+import { eq } from "drizzle-orm";
 import { beforeEach, expect, it } from "vitest";
-import "@/test/mongo";
-import { Campaign } from "@/lib/models/campaign";
-import { User } from "@/lib/models/user";
+import { campaignCallers, campaigns } from "@/lib/db";
 import { signedInAs } from "@/test/auth";
+import { resetDb, testDb as db } from "@/test/db";
+import { makeUser, type TestUser } from "@/test/fixtures";
 import { duplicateCampaign, saveCampaign } from "./actions";
 
-type U = InstanceType<typeof User>;
-let owner: U, caller: U;
+let owner: TestUser, caller: TestUser;
 const input = () => ({
   name: "October intake",
   classLabel: "2027 A/L Theory",
@@ -18,15 +18,14 @@ const input = () => ({
   script: "Hello {name}",
   fee: "Rs. 2,500",
   link: "",
-  callers: [{ userId: String(caller._id), dailyCallTarget: Number.NaN }], // blank override
+  callers: [{ userId: caller.id, dailyCallTarget: Number.NaN }], // blank override
 });
+const callersOf = (id: string) => db.select().from(campaignCallers).where(eq(campaignCallers.campaignId, id));
 
 beforeEach(async () => {
-  await Promise.all([User.deleteMany({}), Campaign.deleteMany({})]);
-  [owner, caller] = await User.create([
-    { name: "Owner", email: "o@example.test", passwordHash: "x", role: "owner", mustChangePassword: false },
-    { name: "Caller", email: "c@example.test", passwordHash: "x", role: "caller", mustChangePassword: false },
-  ]);
+  await resetDb();
+  owner = await makeUser("Owner", "owner");
+  caller = await makeUser("Caller", "caller");
 });
 
 it("is owner-only", async () => {
@@ -37,28 +36,25 @@ it("is owner-only", async () => {
 it("creates, validates and updates a campaign", async () => {
   signedInAs(owner);
   expect(await saveCampaign({ ...input(), endDate: "2026-09-01" })).toMatchObject({ ok: false });
-  expect(await saveCampaign({ ...input(), callers: [{ userId: String(owner._id) }] })).toMatchObject({ ok: false }); // not a caller
+  expect(await saveCampaign({ ...input(), callers: [{ userId: owner.id }] })).toMatchObject({ ok: false }); // not a caller
 
   const res = await saveCampaign(input());
   expect(res.ok).toBe(true);
   const id = res.ok ? res.id : "";
-  expect((await Campaign.findById(id))?.callers[0].dailyCallTarget).toBeUndefined();
+  expect((await callersOf(id))[0].dailyCallTarget).toBeNull();
 
-  await saveCampaign({ ...input(), id, callers: [{ userId: String(caller._id), dailyCallTarget: 80 }] });
-  expect(await Campaign.countDocuments()).toBe(1);
-  expect((await Campaign.findById(id))?.callers[0].dailyCallTarget).toBe(80);
+  await saveCampaign({ ...input(), id, callers: [{ userId: caller.id, dailyCallTarget: 80 }] });
+  expect(await db.select().from(campaigns)).toHaveLength(1);
+  expect(await callersOf(id)).toMatchObject([{ userId: caller.id, dailyCallTarget: 80 }]);
 });
 
-it("duplicates a campaign as a draft", async () => {
+it("duplicates a campaign as a draft, with its callers", async () => {
   signedInAs(owner);
   const res = await saveCampaign(input());
   const copy = await duplicateCampaign(res.ok ? res.id : "");
   expect(copy.ok).toBe(true);
-  expect(await Campaign.findById(copy.ok ? copy.id : "")).toMatchObject({
-    name: "Copy of October intake",
-    status: "draft",
-    script: "Hello {name}",
-    fee: "Rs. 2,500",
-    dailyCallTarget: 60,
-  });
+  const copyId = copy.ok ? copy.id : "";
+  const [c] = await db.select().from(campaigns).where(eq(campaigns.id, copyId));
+  expect(c).toMatchObject({ name: "Copy of October intake", status: "draft", script: "Hello {name}", fee: "Rs. 2,500", dailyCallTarget: 60 });
+  expect(await callersOf(copyId)).toMatchObject([{ userId: caller.id }]);
 });

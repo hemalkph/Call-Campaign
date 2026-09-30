@@ -2,10 +2,8 @@ import Link from "next/link";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { AuditEvent } from "@/lib/models/audit-event";
-import { Campaign } from "@/lib/models/campaign";
-import { Contact } from "@/lib/models/contact";
-import { User } from "@/lib/models/user";
+import { count, desc, eq, inArray } from "drizzle-orm";
+import { auditEvents, campaigns, contacts, db, users as usersTable } from "@/lib/db";
 import { requireOwner } from "@/lib/session";
 import { fmtDateTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -40,26 +38,28 @@ const label = (a: string) => ACTION_LABEL[a] ?? (a.startsWith("export.") ? `Expo
 export default async function AuditPage({ searchParams }: { searchParams: Promise<{ action?: string; page?: string }> }) {
   await requireOwner();
   const sp = await searchParams;
-  const actions: string[] = (await AuditEvent.distinct("action")).sort();
+  const actions = (await db.selectDistinct({ action: auditEvents.action }).from(auditEvents)).map((a) => a.action).sort();
   const action = actions.includes(sp.action ?? "") ? sp.action : undefined;
   const page = Math.max(1, Number.parseInt(sp.page ?? "1", 10) || 1);
-  const filter = action ? { action } : {};
+  const filter = action ? eq(auditEvents.action, action) : undefined;
 
-  const [events, total] = await Promise.all([
-    AuditEvent.find(filter).sort({ at: -1 }).skip((page - 1) * PAGE).limit(PAGE).lean(),
-    AuditEvent.countDocuments(filter),
+  const [events, [{ total }]] = await Promise.all([
+    db.select().from(auditEvents).where(filter).orderBy(desc(auditEvents.at)).limit(PAGE).offset((page - 1) * PAGE),
+    db.select({ total: count() }).from(auditEvents).where(filter),
   ]);
-  const ids = (entity: string) => events.filter((e) => e.entity === entity && e.entityId).map((e) => e.entityId);
-  const [users, contacts, campaigns] = await Promise.all([
-    User.find({ _id: { $in: [...events.map((e) => e.actorId), ...ids("users")] } }, { name: 1 }).lean(),
-    Contact.find({ _id: { $in: ids("contacts") } }, { name: 1 }).lean(),
-    Campaign.find({ _id: { $in: ids("campaigns") } }, { name: 1 }).lean(),
+  const ids = (entity: string) => events.filter((e) => e.entity === entity && e.entityId).map((e) => e.entityId!);
+  const byId = async (table: typeof usersTable | typeof contacts | typeof campaigns, list: string[]) =>
+    list.length ? db.select({ id: table.id, name: table.name }).from(table).where(inArray(table.id, list)) : [];
+  const [users, contactNames, campaignNames] = await Promise.all([
+    byId(usersTable, [...events.flatMap((e) => (e.actorId ? [e.actorId] : [])), ...ids("users")]),
+    byId(contacts, ids("contacts")),
+    byId(campaigns, ids("campaigns")),
   ]);
-  const nameOf = (list: { _id: unknown; name: string }[], id: unknown) => list.find((x) => String(x._id) === String(id))?.name;
+  const nameOf = (list: { id: string; name: string }[], id: unknown) => list.find((x) => x.id === id)?.name;
   const subject = (e: (typeof events)[number]) =>
     (e.entity === "users" && nameOf(users, e.entityId)) ||
-    (e.entity === "contacts" && nameOf(contacts, e.entityId)) ||
-    (e.entity === "campaigns" && nameOf(campaigns, e.entityId)) ||
+    (e.entity === "contacts" && nameOf(contactNames, e.entityId)) ||
+    (e.entity === "campaigns" && nameOf(campaignNames, e.entityId)) ||
     e.entity;
   const pages = Math.max(1, Math.ceil(total / PAGE));
   const href = (p: number) => `/audit?${new URLSearchParams({ ...(action ? { action } : {}), page: String(p) })}`;
@@ -81,7 +81,7 @@ export default async function AuditPage({ searchParams }: { searchParams: Promis
           </TableHeader>
           <TableBody>
             {events.map((e) => (
-              <TableRow key={String(e._id)}>
+              <TableRow key={e.id}>
                 <TableCell className="w-28 whitespace-normal sm:w-auto sm:whitespace-nowrap">{fmtDateTime(e.at)}</TableCell>
                 <TableCell className="hidden sm:table-cell">{e.actorId ? (nameOf(users, e.actorId) ?? "Deleted user") : "System"}</TableCell>
                 <TableCell className="whitespace-normal break-words">
@@ -129,13 +129,17 @@ export default async function AuditPage({ searchParams }: { searchParams: Promis
 }
 
 /** A compact, readable before → after. Stage codes and user ids are turned into names. */
-function Details({ before, after, users }: { before: unknown; after: unknown; users: { _id: unknown; name: string }[] }) {
+function Details({ before, after, users }: { before: unknown; after: unknown; users: { id: string; name: string }[] }) {
   const show = (v: unknown): string => {
     if (v === null || v === undefined) return "none";
-    if (typeof v === "string") return STAGE_META[v as Stage]?.label ?? users.find((u) => String(u._id) === v)?.name ?? v;
+    if (typeof v === "string") return STAGE_META[v as Stage]?.label ?? users.find((u) => u.id === v)?.name ?? v;
     if (Array.isArray(v)) return v.map(show).join(", ");
     if (typeof v === "object") {
-      const entries = Object.entries(v as Record<string, unknown>).filter(([, x]) => x !== undefined);
+      // jsonb stores keys shortest-first; show the main change first and "how" (via / callId) last.
+      const last = (k: string) => (k === "via" || k === "callId" ? 1 : 0);
+      const entries = Object.entries(v as Record<string, unknown>)
+        .filter(([, x]) => x !== undefined)
+        .sort(([a], [b]) => last(a) - last(b));
       if (entries.length > 5) return `${entries.length} items`;
       return entries.map(([k, x]) => `${k}: ${show(x)}`).join("; ");
     }

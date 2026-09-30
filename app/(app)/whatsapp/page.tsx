@@ -2,7 +2,8 @@ import Link from "next/link";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { activeCampaignsFor, listContacts, PAGE_SIZE, parseListParams } from "@/lib/contacts-query";
-import { Template } from "@/lib/models/template";
+import { asc } from "drizzle-orm";
+import { db, templates as templatesTable } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { WhatsAppList } from "./whatsapp-list";
 
@@ -28,7 +29,7 @@ export default async function WhatsAppPage({ searchParams }: { searchParams: Pro
   const campaign = campaigns.find((c) => c.id === params.campaign) ?? campaigns[0];
   const [{ rows, total }, templates] = await Promise.all([
     listContacts(me, campaign.id, { ...params, sort: "name", dir: "asc" }),
-    Template.find().sort({ language: 1, name: 1 }).lean(),
+    db.select().from(templatesTable).orderBy(asc(templatesTable.language), asc(templatesTable.name)),
   ]);
 
   return (
@@ -41,9 +42,9 @@ export default async function WhatsAppPage({ searchParams }: { searchParams: Pro
         params={{ ...params, campaign: campaign.id }}
         total={total}
         pageSize={PAGE_SIZE}
-        templates={templates.map((t) => ({ id: String(t._id), name: t.name, language: t.language, body: t.body }))}
+        templates={templates.map((t) => ({ id: t.id, name: t.name, language: t.language, body: t.body }))}
         rows={rows.map((c) => ({
-          id: String(c._id),
+          id: c.id,
           name: c.name,
           phone: c.phone,
           stage: c.stage,

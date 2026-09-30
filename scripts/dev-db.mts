@@ -1,17 +1,23 @@
-// Local MongoDB for development without installing MongoDB or Docker. Data persists in .dev-db/.
-import { mkdirSync } from "node:fs";
-import { MongoMemoryServer } from "mongodb-memory-server";
+// Local PostgreSQL for development — no install or Docker needed. It's PGlite (Postgres compiled
+// to WebAssembly) served on the normal Postgres port. Data is kept in .pgdata/.
+import { PGlite } from "@electric-sql/pglite";
+import { PGLiteSocketServer } from "@electric-sql/pglite-socket";
+import { drizzle } from "drizzle-orm/pglite";
+import { migrate } from "drizzle-orm/pglite/migrator";
 
-mkdirSync(".dev-db", { recursive: true });
-const server = await MongoMemoryServer.create({
-  instance: { port: 27017, dbPath: ".dev-db", storageEngine: "wiredTiger" },
-});
-console.log(`MongoDB running at ${server.getUri()} — use MONGODB_URI=mongodb://127.0.0.1:27017/call-campaign-dev`);
+const pg = await PGlite.create(".pgdata");
+await migrate(drizzle(pg), { migrationsFolder: "drizzle" }); // always up to date
+// Two connections (the app + a script like the seed). PGlite is single-connection underneath; more
+// simultaneous connections can garble replies, so the app uses a pool of 1 locally (DATABASE_POOL_MAX).
+const server = new PGLiteSocketServer({ db: pg, host: "127.0.0.1", port: 5432, maxConnections: 2 });
+await server.start();
+console.log("PostgreSQL (PGlite) running — use DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres");
 console.log("Press Ctrl+C to stop.");
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, async () => {
-    await server.stop({ doCleanup: false });
+    await server.stop();
+    await pg.close();
     process.exit(0);
   });
 }
